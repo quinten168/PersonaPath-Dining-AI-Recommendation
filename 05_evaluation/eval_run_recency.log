@@ -1,0 +1,82 @@
+Loading data...
+Reviews : 274,563
+Users   : 20,017
+Biz     : 1,962
+Evaluating 2,000 users (min 10 reviews each)
+  eval progress: 0 / 2,000
+  eval progress: 500 / 2,000
+  eval progress: 1,000 / 2,000
+  eval progress: 1,500 / 2,000
+Evaluated 1,929 users (71 skipped for no test-liked / empty vector)
+  of which 0 had no embedding coverage and were skipped for 'embedding' only (still counted for cbf/popularity/random)
+
+==============================================================================
+OVERALL RESULTS (mean across users)
+==============================================================================
+               precision  recall    ndcg  hit_rate     mrr
+system     k                                              
+cbf        5      0.0207  0.0262  0.0245    0.0975  0.0406
+           10     0.0206  0.0515  0.0343    0.1742  0.0508
+embedding  5      0.0245  0.0308  0.0307    0.1089  0.0509
+           10     0.0207  0.0529  0.0377    0.1695  0.0590
+popularity 5      0.0228  0.0289  0.0315    0.1037  0.0564
+           10     0.0177  0.0417  0.0349    0.1493  0.0623
+random     5      0.0023  0.0031  0.0034    0.0109  0.0060
+           10     0.0024  0.0066  0.0047    0.0238  0.0078
+
+==============================================================================
+LIFT — cbf & embedding vs baselines
+==============================================================================
+
+@K=5
+  metric          cbf    embed    popul   random   lift cbf-pop  lift emb-pop  lift emb-cbf
+  precision    0.0207   0.0245   0.0228   0.0023         -9.1%         +7.3%        +18.0%
+  recall       0.0262   0.0308   0.0289   0.0031         -9.6%         +6.3%        +17.6%
+  ndcg         0.0245   0.0307   0.0315   0.0034        -22.3%         -2.6%        +25.4%
+  hit_rate     0.0975   0.1089   0.1037   0.0109         -6.0%         +5.0%        +11.7%
+  mrr          0.0406   0.0509   0.0564   0.0060        -28.1%         -9.8%        +25.4%
+
+@K=10
+  metric          cbf    embed    popul   random   lift cbf-pop  lift emb-pop  lift emb-cbf
+  precision    0.0206   0.0207   0.0177   0.0024        +16.1%        +17.0%         +0.8%
+  recall       0.0515   0.0529   0.0417   0.0066        +23.5%        +26.7%         +2.6%
+  ndcg         0.0343   0.0377   0.0349   0.0047         -1.9%         +7.8%         +9.9%
+  hit_rate     0.1742   0.1695   0.1493   0.0238        +16.7%        +13.5%         -2.7%
+  mrr          0.0508   0.0590   0.0623   0.0078        -18.5%         -5.3%        +16.2%
+
+==============================================================================
+LEAKAGE CAVEAT — read before treating 'embedding vs cbf' as a clean A/B
+==============================================================================
+embedding: leave-out user vectors, rebuilt fresh per split, no cross-review
+  training step.
+cbf: user vectors are a weighted average of each training business's LDA
+  topic vector -- also leave-out at the user level -- BUT the underlying
+  LDA topic model was trained once on the full corpus back in notebook 02
+  and never saved, so it could not be retrained per-split here (out of
+  scope). That gives cbf's topic vectors a mild, structural, hard-to-
+  quantify advantage that embedding does not share. If embedding matches
+  or beats cbf despite this, that's a stronger result than the raw
+  numbers show.
+
+==============================================================================
+BY PERSONA  (cbf only, @K=10)
+==============================================================================
+                                 precision  recall    ndcg  hit_rate     mrr  n_users
+persona                                                                              
+Comfort Food & Sandwiches           0.0571  0.0581  0.0761    0.2857  0.1607        7
+Spicy & Asian Flavors               0.0267  0.0696  0.0495    0.2442  0.0787       86
+Food Trucks & Trendy Spots          0.0265  0.0640  0.0460    0.2335  0.0763      257
+Dinner & Happy Hour                 0.0250  0.1250  0.1150    0.2500  0.1667        8
+Bar & Nightlife Crowd               0.0238  0.0682  0.0440    0.1786  0.0514       84
+Cocktail Bars & Speakeasy           0.0234  0.0449  0.0350    0.1786  0.0629      252
+Outdoor & Street Seating            0.0231  0.0357  0.0284    0.1538  0.0504       26
+Fine Dining & Tasting Menu          0.0227  0.0356  0.0232    0.1364  0.0250       22
+Brunch & Breakfast                  0.0215  0.0470  0.0312    0.1782  0.0496      275
+Desserts & Bakery                   0.0212  0.0376  0.0305    0.1529  0.0473       85
+Small Plates & Cocktails            0.0202  0.0637  0.0406    0.1915  0.0579       94
+Venue & Location Experience         0.0200  0.0726  0.0415    0.1714  0.0458       70
+Value & Portion Size                0.0200  0.0667  0.0313    0.2000  0.0286        5
+Cafe, Coffee & Reading Terminal     0.0179  0.0524  0.0283    0.1604  0.0375      106
+Craft Beer & Sports Bars            0.0178  0.0608  0.0357    0.1778  0.0427       90
+
+Per-user results saved: eval_per_user.csv

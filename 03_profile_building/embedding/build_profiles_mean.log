@@ -1,0 +1,10 @@
+Aggregation strategy: mean
+Loading per-review embeddings + meta ...
+  274,563 reviews, dim=384
+Building business profiles ...
+  1,962 businesses, 0 low-confidence (< 5 reviews)
+  no low-confidence businesses to blend -- skipping (see KNOWN CAVEAT in this file's docstring)
+Saved: ../data_samples/business_embeddings.csv
+Building user profiles ...
+  20,017 users, 0 low-confidence (< 3 reviews) -- flagged only, no category concept for users so no blending is applied
+Saved: ../data_samples/user_embeddings.csv
