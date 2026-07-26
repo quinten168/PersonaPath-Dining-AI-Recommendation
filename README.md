@@ -1,66 +1,73 @@
-# PersonaPath: Personalized Travel & Dining Recommendation Engine
+# PersonaPath: Personalized Dining Recommendation Engine
 ### *Beyond Proximity: A Behavioral-Driven Discovery Engine for the Modern Diner*
 
 [![PersonaPath](https://img.shields.io/badge/PersonaPath-v1.0-blue?style=for-the-badge&logo=openai)](https://github.com/DhairyaLunia/Team5_Big_data)
 [![Apache Spark](https://img.shields.io/badge/Distributed_Processing-Apache_Spark-E25A1C?style=for-the-badge&logo=apachespark&logoColor=white)](https://spark.apache.org/)
-[![Gensim](https://img.shields.io/badge/Behavioral_Modeling-Gensim_LDA-blue?style=for-the-badge)](https://radimrehurek.com/gensim/)
-<span style="background-color:#fff3cd">[![JSD](https://img.shields.io/badge/Vector_Similarity-Jensen--Shannon_Divergence-0433FF?style=for-the-badge)](https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.distance.jensenshannon.html)</span>
+[![scikit-learn](https://img.shields.io/badge/Behavioral_Modeling-TF--IDF_%2B_Embeddings-blue?style=for-the-badge&logo=scikitlearn)](https://scikit-learn.org/)
+[![Cosine Similarity](https://img.shields.io/badge/Vector_Similarity-Cosine_Similarity-0433FF?style=for-the-badge)](https://scikit-learn.org/stable/modules/metrics.html#cosine-similarity)
 
 ---
 
 ## 🌟 Executive Summary
 Traditional recommendation platforms (like Yelp or Google Maps) answer the question: *"What is nearby?"* **PersonaPath** answers the question: *"Who am I, and where should I go?"*
 
-Built by **Team 5 at the Carlson School of Management (MSBA)**, PersonaPath is a sophisticated recommendation engine that leverages 6.9 million Yelp reviews to build deep behavioral profiles. By combining **LDA Topic Modeling**, **VADER Sentiment Analysis**, and **Jensen-Shannon Divergence (JSD) Vector Similarity Search**, we deliver personalized dining matches with natural language justifications.
+Built by **Team 5 at the Carlson School of Management (MSBA)**, PersonaPath is a recommendation engine that builds deep behavioral profiles from Yelp reviews. By combining **TF-IDF profile similarity** (interpretable, and the best-performing method on our own evaluation — see [`ARCHITECTURE.md`](./ARCHITECTURE.md)), **sentence embeddings** for semantic matching, and **live free-text prompt matching**, we deliver personalized dining matches a user can ask for in their own words.
+
+> The engine originally launched on a Philadelphia review subset using LDA topic modeling + Jensen-Shannon Divergence similarity. That pipeline has since been retired in favor of TF-IDF, which our own evaluation harness showed outperforms it on every ranking metric — the project is now being extended to a New Orleans review subset.
 
 ---
 
-## 🏗️ The PersonaPath Engine: 4-Layer Architecture
-Our recommendation logic is built on a proprietary four-layer weighted scoring system that balances historical behavior, current intent, and absolute quality.
+## 🏗️ The PersonaPath Engine: Scoring Architecture
+Our recommendation logic blends historical taste, live intent, and business quality into one ranked score.
 
 | Layer | Component | Weight | Logic |
 | :--- | :--- | :--- | :--- |
-| **Layer 1** | **Behavioral DNA** | **0.50** | 25-dimensional topic vectors calculated per business and user using LDA. Matches users with the "vibe" of a restaurant. |
-| **Layer 2** | **Query Intent Boost** | **0.30** | Dynamic intent scoring for 5 personas: *Romantic, Solo Work, Family, Group, Hidden Gem*. |
-| **Layer 3** | **EAS Quality Score** | **0.20** | `Sentiment × (1 - Topic Entropy) × Log(Review Count)`. Penalizes inconsistency and rewards established excellence. |
-| **Layer 4** | **LLM Concierge** | **N/A** | GPT-4o-mini explanation layer — JSD-ranked restaurant metadata is passed as structured context to generate personalized natural language justifications for every recommendation.</span> |
+| **Historical Profile Similarity** | TF-IDF Behavioral DNA | primary | Cosine similarity between a user's and a business's TF-IDF review-term profile — literal, interpretable, and (per our own evaluation) the best-performing similarity method we've tried. |
+| | + Sentence-Embedding Similarity | optional blend | Cosine similarity over `all-MiniLM-L6-v2` review embeddings, blended in alongside TF-IDF for semantic/paraphrase coverage TF-IDF alone misses. |
+| **Live Prompt Match** | Free-text query matching | 0.75 within the blend above | A user's live prompt ("find me a romantic spot") is vectorized with the *same* fitted TF-IDF vectorizer + embedding model, then blended with the historical profile match — weighted so the explicit ask dominates over general taste history. |
+| **Popularity Prior** | `stars × log(1 + review_count)` | 0.50 vs. similarity | Rewards established, well-rated businesses without needing a sentiment or topic model. |
+| **LLM Concierge** | Natural-language explanation | N/A | GPT-4o-mini explanation layer — the ranked shortlist is passed as structured context to generate personalized justifications for every recommendation. |
 
 ---
 
 ## 🔬 Key Technical Innovations
-### 1. Behavioral Isolation (The "Cuisine-Blind" LDA)
-To prevent the engine from simply matching cuisine types (which is already handled by categorical filters), we surgically removed **99 cuisine-specific words** (e.g., *sushi, taco, pizza*) from the LDA corpus. This forced the model to learn **behaviors** (e.g., *attentive service, quiet atmosphere, efficient takeout*) rather than just food categories.
 
-### 2. The EAS Quality Metric
-We developed the **Entropy-Adjusted Sentiment (EAS)** score to solve the "generic rating" problem. By multiplying sentiment with the inverse of topic entropy, we identify businesses that are not just highly rated, but **consistently great at their core persona**.
+### 1. TF-IDF as the Primary Similarity Signal
+Rather than compressing reviews into a small set of pre-named topics, we keep the full literal term/bigram vocabulary (~20,000 features) as each business's and user's profile representation. On our own offline evaluation, this **beat both LDA-topic similarity and sentence-embedding similarity on every ranking metric** (Precision@K, Recall@K, NDCG@K, HitRate@K, MRR) — see [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the numbers. It's also the only one of the three that's directly interpretable: every profile ships with its own top-6-term label (e.g. *"happy hour, craft beer, patio"*), no separate labeling step required.
 
-### 3. Jensen-Shannon Divergence (JSD) Similarity</span>
-Rather than approximate nearest-neighbor search, we use **Jensen-Shannon Divergence** to measure the distributional distance between user and business topic vectors. JSD is well-suited for probability distributions like our LDA topic outputs, providing a more behaviorally grounded similarity score than cosine or Euclidean distance.
+### 2. Live Free-Text Query Matching
+Rather than a fixed set of hand-picked "mood" categories, a user's live prompt is vectorized at request time with the same fitted TF-IDF vectorizer and sentence-transformer used to build the profiles — no retraining, no closed taxonomy. TF-IDF catches literal keyword overlap; embeddings catch paraphrases the literal match misses (a prompt saying "romantic" matching reviews that say "candlelit" or "intimate"). The two are blended, weighted toward the live prompt over general taste history, since an explicit ask should outweigh what a user has liked in the past.
+
+### 3. Popularity Prior
+Business quality is scored as `stars × log(1 + review_count)` — rewarding established, consistently well-rated businesses without depending on a sentiment model or topic-model output.
 
 ### 4. Distributed Scale
-Processing 6.9 million reviews across thousands of users required a distributed approach. Using **Apache Spark on Databricks**, we implemented a high performance pipeline that persists data in **Delta Lake** for schema reliability and rapid retrieval.
+Built on **Apache Spark on Databricks**, with review/business/user data and generated profiles stored in **Unity Catalog** (managed tables + Volumes) for schema reliability and shared access across pipeline stages.
 
 ---
 
 ## 👥 The Team
-*   **Saloni Jain:** Lead for LDA Behavioral Modeling and Feature Engineering.
-*   **Quinten:** Lead for Recommender System Design, JSD Similarity Scoring, and LLM Explanation Pipeline.
+*   **Saloni Jain:** Lead for LDA Behavioral Modeling and Feature Engineering (original Philadelphia pipeline).
+*   **Quinten:** Lead for Recommender System Design, Similarity Scoring, and LLM Explanation Pipeline.
 *   **Dhairya:** Lead for Model Optimization, LLM Integration, data processing, LLM Explanation Pipeline to Streamlit Dashboard Development.
 *   **Esther:** Lead for PersonaPath Flier and Presentation.
-*   **Lear:** Lead for LDA Data Pipeline orchestration, Streamlit Dashboard Interface Design and Presentation Deck & Strategy.
+*   **Lear:** Lead for Data Pipeline orchestration (original Philadelphia pipeline), Streamlit Dashboard Interface Design and Presentation Deck & Strategy.
 
 ---
 
-## 📊 Project Impact (Philadelphia Subset)
+## 📊 Project Impact
+**Original Philadelphia pilot** (LDA + JSD, since retired — see above):
 *   **1,962** Restaurants profiled across 48 behavioral and intent features.
 *   **20,017** Unique User Personas built from historical dining patterns.
 *   **261,000** High-quality reviews analyzed for sentiment and topic distribution.
+
+**New Orleans** (current, TF-IDF + embeddings): pipeline built; evaluation pending an actual end-to-end run — numbers to follow once the New Orleans dataset has been processed.
 
 ---
 
 ## 🔗 Resources & Navigation
 *   🚀 **[Quick Start Guide](INSTRUCTIONS.md)** - How to run the pipeline.
-*   📓 **Pipeline stages** - [`01_data_processing/`](./01_data_processing/) → [`02_topic_modeling_lda/`](./02_topic_modeling_lda/) → [`03_profile_building/`](./03_profile_building/) → [`04_scoring/`](./04_scoring/) → [`05_evaluation/`](./05_evaluation/) → [`06_recommender_app/`](./06_recommender_app/) (Data Processing to Interface — see [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the embedding pipeline's stage-by-stage detail).
+*   📓 **Pipeline stages** - [`01_data_processing/`](./01_data_processing/) → [`03_profile_building/`](./03_profile_building/) → [`04_scoring/`](./04_scoring/) → [`05_evaluation/`](./05_evaluation/) → [`06_recommender_app/`](./06_recommender_app/) (Data Processing to Interface — see [`ARCHITECTURE.md`](./ARCHITECTURE.md) for stage-by-stage detail).
 *   📁 **[Demo Walkthrough](./demo/)** - See the engine and walkthrough video in action.
 *   📄 **[Project Flyer](./flier/Team5_PersonaPath_Flier.pdf)** - Executive summary PDF.
 *   📚 **[Bibliography](./BIBLIOGRAPHY.md)** - Data and library credits.

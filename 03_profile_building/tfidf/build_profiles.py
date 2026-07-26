@@ -6,17 +6,26 @@ Standalone counterpart to 03_profile_building/embedding/build_profiles.py --
 same role (aggregate per-review vectors into group profiles + a
 human-readable label), but reusing none of that pipeline's code.
 
-Input:
-    ../../data/interim/review_tfidf.npz         (from vectorize.py)
-    ../../data/interim/review_tfidf_meta.csv    (from vectorize.py)
-    ../../data/interim/tfidf_vectorizer.joblib  (from vectorize.py, for feature names)
-Output:
-    ../../data/profiles/business_tfidf_profiles.npz        (sparse, L2-normalized,
-                                                              n_businesses x n_features)
-    ../../data/profiles/business_tfidf_profiles_meta.csv   (business_id, n_reviews,
-                                                              low_confidence, label)
-    ../../data/profiles/user_tfidf_profiles.npz
-    ../../data/profiles/user_tfidf_profiles_meta.csv
+The mean/recency weighting + aggregation logic (compute_review_weights,
+build_group_tfidf_profiles) used to live in a separate aggregation.py, kept
+apart from this file's I/O/orchestration for testability and to mirror
+03_profile_building/embedding/aggregation.py's structure. Merged back in
+here since that separation wasn't earning its keep for a module this
+small -- if you change the weighting scheme, change the embedding
+pipeline's copy too if you want the two pipelines to stay comparable under
+"recency" (see that file's docstring).
+
+Input (Unity Catalog Volume -- matches vectorize.py's output location):
+    /Volumes/persona-path/default/interim/review_tfidf.npz         (from vectorize.py)
+    /Volumes/persona-path/default/interim/review_tfidf_meta.csv    (from vectorize.py)
+    /Volumes/persona-path/default/interim/tfidf_vectorizer.joblib  (from vectorize.py, for feature names)
+Output (Unity Catalog Volume, so these survive past this job's cluster):
+    /Volumes/persona-path/default/profiles/business_tfidf_profiles.npz        (sparse, L2-normalized,
+                                                                                 n_businesses x n_features)
+    /Volumes/persona-path/default/profiles/business_tfidf_profiles_meta.csv   (business_id, n_reviews,
+                                                                                 low_confidence, label)
+    /Volumes/persona-path/default/profiles/user_tfidf_profiles.npz
+    /Volumes/persona-path/default/profiles/user_tfidf_profiles_meta.csv
 
 `label` is the top-6 TF-IDF terms by weight for that business/user -- unlike
 the embedding pipeline's label step (profile_labels.build_group_labels),
@@ -24,26 +33,28 @@ which computes this same weighted-sum sparse matmul and then discards it
 after extracting the label string, here the matrix itself IS the profile
 representation used for similarity scoring, so nothing is computed twice.
 
-Cold-start category-prior blending is not implemented here -- see
-aggregation.py's module docstring for why that's a documented
-simplification, not a regression.
+Cold-start category-prior blending is not implemented here -- explicitly
+out of scope for this pass. It currently blends 0 rows in the embedding
+pipeline on this corpus (every business/user already clears the
+min_reviews floor upstream), so skipping it here is a documented
+simplification, not a regression relative to what the embedding pipeline
+actually does today.
 """
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 import joblib
+from sklearn.preprocessing import normalize
 
-from aggregation import build_group_tfidf_profiles
+VOLUME_ROOT = "/Volumes/persona-path/default"
+REVIEW_TFIDF_NPZ = f"{VOLUME_ROOT}/interim/review_tfidf.npz"
+REVIEW_TFIDF_META = f"{VOLUME_ROOT}/interim/review_tfidf_meta.csv"
+VECTORIZER_PATH = f"{VOLUME_ROOT}/interim/tfidf_vectorizer.joblib"
 
-ROOT = "../.."  # run this script from inside 03_profile_building/tfidf/
-REVIEW_TFIDF_NPZ = f"{ROOT}/data/interim/review_tfidf.npz"
-REVIEW_TFIDF_META = f"{ROOT}/data/interim/review_tfidf_meta.csv"
-VECTORIZER_PATH = f"{ROOT}/data/interim/tfidf_vectorizer.joblib"
-
-OUT_BUSINESS_TFIDF = f"{ROOT}/data/profiles/business_tfidf_profiles.npz"
-OUT_BUSINESS_TFIDF_META = f"{ROOT}/data/profiles/business_tfidf_profiles_meta.csv"
-OUT_USER_TFIDF = f"{ROOT}/data/profiles/user_tfidf_profiles.npz"
-OUT_USER_TFIDF_META = f"{ROOT}/data/profiles/user_tfidf_profiles_meta.csv"
+OUT_BUSINESS_TFIDF = f"{VOLUME_ROOT}/profiles/business_tfidf_profiles.npz"
+OUT_BUSINESS_TFIDF_META = f"{VOLUME_ROOT}/profiles/business_tfidf_profiles_meta.csv"
+OUT_USER_TFIDF = f"{VOLUME_ROOT}/profiles/user_tfidf_profiles.npz"
+OUT_USER_TFIDF_META = f"{VOLUME_ROOT}/profiles/user_tfidf_profiles_meta.csv"
 
 AGGREGATION_STRATEGY = "mean"      # "mean" | "recency" -- baseline default,
                                     # matches the embedding pipeline's
@@ -52,6 +63,71 @@ DECAY_CONSTANT_DAYS = 30.0         # only used when AGGREGATION_STRATEGY == "rec
 MIN_REVIEWS_BUSINESS = 5
 MIN_REVIEWS_USER = 3
 TOP_N_LABEL_TERMS = 6
+
+
+def compute_review_weights(meta_df: pd.DataFrame, strategy: str,
+                            decay_constant: float = 30.0,
+                            reference_date=None) -> np.ndarray:
+    """
+    Per-review weight, aligned to meta_df's row order -- how much does a
+    review count toward its group's profile.
+
+    "mean" -> all ones. "recency" -> 1 / (1 + days_old / decay_constant),
+    days_old measured against reference_date (defaults to the latest date
+    in meta_df).
+    """
+    if strategy not in ("mean", "recency"):
+        raise ValueError(f"unknown aggregation strategy: {strategy!r}")
+    if strategy != "recency":
+        return np.ones(len(meta_df), dtype=np.float64)
+    dates = pd.to_datetime(meta_df["date"])
+    if reference_date is None:
+        reference_date = dates.max()
+    days_old = (reference_date - dates).dt.total_seconds().values / 86400.0
+    return 1.0 / (1.0 + days_old / decay_constant)
+
+
+def build_group_tfidf_profiles(tfidf_matrix, meta_df: pd.DataFrame, group_col: str,
+                                strategy: str = "mean", min_reviews: int = 5,
+                                decay_constant: float = 30.0, reference_date=None):
+    """
+    Aggregate per-review TF-IDF rows into one sparse profile vector per
+    group (business_id or user_id), via a weighted-sum sparse matmul, then
+    L2-row-normalize so cosine similarity reduces to a dot product at query
+    time (mirrors the embedding pipeline's normalize_embeddings=True
+    convention -- see similarity_tfidf.py).
+
+    tfidf_matrix: (n_reviews, n_features) sparse CSR, row-aligned with
+        meta_df (i.e. vectorize.py's output).
+    meta_df: DataFrame with at least [group_col, "date"], same row order as
+        tfidf_matrix.
+
+    Returns (profile_matrix, profile_meta):
+        profile_matrix: (n_groups, n_features) sparse CSR, L2-row-normalized.
+        profile_meta: DataFrame [group_col, n_reviews, low_confidence], row
+            order matches profile_matrix (NOT necessarily meta_df's or any
+            external DataFrame's row order -- pd.factorize(sort=True) below
+            orders groups lexicographically by ID. Always resolve rows via
+            an explicit {group_id: row} dict, never assume positional
+            alignment with another table).
+    """
+    weights = compute_review_weights(meta_df, strategy, decay_constant, reference_date)
+
+    codes, uniques = pd.factorize(meta_df[group_col], sort=True)
+    n_groups, n_reviews = len(uniques), len(meta_df)
+    indicator = sp.coo_matrix(
+        (weights, (codes, np.arange(n_reviews))), shape=(n_groups, n_reviews),
+    ).tocsr()
+    weighted_sums = (indicator @ tfidf_matrix).tocsr()
+    profile_matrix = normalize(weighted_sums, norm="l2", axis=1)
+
+    counts = np.bincount(codes, minlength=n_groups)
+    profile_meta = pd.DataFrame({
+        group_col: uniques,
+        "n_reviews": counts,
+    })
+    profile_meta["low_confidence"] = profile_meta["n_reviews"] < min_reviews
+    return profile_matrix, profile_meta
 
 
 def labels_from_profile_matrix(profile_matrix, group_ids, feature_names, top_n=6):

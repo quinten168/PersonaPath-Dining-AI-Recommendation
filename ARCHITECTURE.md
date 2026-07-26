@@ -1,176 +1,187 @@
-# PersonaPath Embedding Pipeline — Architecture
+# PersonaPath Recommendation Pipeline — Architecture
 
-> Additive to the existing LDA + JSD recommender (`01_data_processing/`–`02_topic_modeling_lda/`). Nothing in this
-> pipeline replaces that path — it adds a second, vector-based similarity signal that
-> gets blended with the topic-model score at recommendation time.
+> TF-IDF review-term profiles are the primary similarity signal end to end. Sentence
+> embeddings are an optional secondary signal, blended in for historical
+> profile-to-profile matching and used for semantic live-query matching. The original
+> LDA + JSD pipeline (`02_topic_modeling_lda/`) has been retired: on our own offline
+> evaluation (Stage 05), TF-IDF outperformed both LDA-topic similarity and embedding
+> similarity on every ranking metric — see the numbers below.
 
-Every review becomes a point in a 384-dimensional space; every business and user becomes
-a centroid in that same space. This is the path from raw Yelp text to a cosine-similarity
-score sitting next to the existing topic-model score.
+Every review becomes both a TF-IDF sparse vector (~20,000 literal term/bigram features)
+and a 384-dimensional dense embedding; every business and user becomes a profile in
+both spaces. A live user prompt is vectorized the same way at request time and blended
+with the historical profile match, weighted toward the live prompt.
 
-- **Stages:** 8 (+2 sub-stages)
 - **Root:** `01_data_processing/` … `06_recommender_app/` (stage-based layout, see repo root)
-- **Model:** `all-MiniLM-L6-v2` (sentence-transformers, local, no API cost)
+- **Primary model:** TF-IDF (`scikit-learn TfidfVectorizer`, 20k features, uni+bigrams, English stopwords)
+- **Secondary model:** `all-MiniLM-L6-v2` (sentence-transformers, local, no API cost)
+- **Storage:** Unity Catalog managed table (raw reviews) + Volumes (generated artifacts) — Databricks-hosted, not local files
 
-Each stage's *output* is the next stage's *input* — Stage 00 through 07 run top to
-bottom, once, offline. Nothing runs at request time except **Stage 05**.
-
----
-
-## Stage 00 — Raw Data
-
-*No processing.*
-
-Source exports, dropped in as-is. The Philadelphia business/user universe was already
-established by the topic-model pipeline (notebooks 01–02); this pipeline only adds a
-second signal on top of it.
-
-| Input | Description |
-|---|---|
-| `yelp_academic_dataset_review.json` | ~6.9M reviews, full Yelp corpus |
-| `business_profiles.csv` | 1,962 Philadelphia businesses + LDA topics |
-| `user_profiles.csv` | 20,017 Philadelphia users |
+Each stage's *output* is the next stage's *input* — stages run top to bottom, once,
+offline, except live query matching and final scoring, which run per request.
 
 ---
 
-## Stage 01 — Review Filtering
+## Stage 00 — Ingestion & Filtering *(Databricks notebook, not a local script)*
 
-**Script:** `01_data_processing/prep_reviews.py`
+**Notebook:** `01_data_processing/01_data_processing.ipynb`
 
-Streams the full Yelp corpus down to just the reviews touching the existing
-Philadelphia business/user universe, keeping raw review text — everything downstream
-reads text, not IDs.
+Loads the raw Yelp business/review/user JSON via Spark, filters to a target city
+(currently New Orleans, `review_count >= 50` per business), joins in business and user
+metadata, filters to reviews with `text` length > 50 characters and users with
+`review_count >= 3`, and writes the result to a Unity Catalog **managed table** —
+`persona-path.default.new_orleans_reviews`. This replaces the previous local
+`prep_reviews.py` + parquet-file approach; every downstream stage now reads this table
+via a live Spark session rather than a local file.
 
 | | |
 |---|---|
-| Input | `review.json`, `business/user_profiles.csv` |
-| Script | `prep_reviews.py` |
-| Output | `philly_reviews.parquet` — 274,563 reviews · `review_id, user_id, business_id, stars, date, text` |
+| Input | Yelp `business`/`review`/`user` JSON (Unity Catalog Volume) |
+| Notebook | `01_data_processing.ipynb` |
+| Output | Managed table `persona-path.default.new_orleans_reviews` — `review_id, business_id, user_id, stars, date, text` + business/user metadata |
 
 ---
 
-## Stage 02 — Review Embedding
+## Stage 01 — TF-IDF Vectorization & Profile Building *(primary similarity signal)*
+
+**Scripts:** `03_profile_building/tfidf/vectorize.py`, `build_profiles.py`, `aggregation.py`
+
+Fits one global `TfidfVectorizer` (20,000 features, uni+bigrams, English stopwords)
+over the full review corpus, then aggregates per-review TF-IDF rows into one
+L2-normalized profile vector per business and per user (mean- or recency-weighted sum),
+so cosine similarity at query time reduces to a dot product. Each profile also gets a
+top-6-term label for free (e.g. *"happy hour, craft beer, patio"*) — interpretable by
+construction, no separate labeling step needed.
+
+| | |
+|---|---|
+| Input | `persona-path.default.new_orleans_reviews` (managed table) |
+| Script | `vectorize.py` — fit + transform → `review_tfidf.npz`/`_meta.csv`/`tfidf_vectorizer.joblib`<br>`build_profiles.py` — `aggregation.build_group_tfidf_profiles()` → per-group profile matrix + label |
+| Output (Volume) | `business_tfidf_profiles.npz`/`_meta.csv`, `user_tfidf_profiles.npz`/`_meta.csv` |
+
+---
+
+## Stage 02 — Review Embedding *(secondary signal, optional)*
 
 **Script:** `03_profile_building/embedding/embeddings.py`
 
-Encodes every review independently with `sentence-transformers`
-(`all-MiniLM-L6-v2`), `normalize_embeddings=True` so cosine similarity later reduces to
-a plain dot product. Offline batch job (`BATCH_SIZE=256`) — never run at request time,
-matching the batch-only scope of this pipeline.
+Encodes every review independently with `sentence-transformers` (`all-MiniLM-L6-v2`,
+`normalize_embeddings=True`). Additive: the app degrades gracefully to TF-IDF-only for
+both historical similarity and live query matching if these artifacts don't exist.
 
 | | |
 |---|---|
-| Input | `philly_reviews.parquet` |
+| Input | `persona-path.default.new_orleans_reviews` (managed table) |
 | Script | `embeddings.py` — all-MiniLM-L6-v2, local, no API cost |
-| Output | `review_embeddings.npy` — 274,563 × 384, float32 memmap<br>`review_embeddings_meta.csv` — `review_id, business_id, user_id, stars, date` |
+| Output (Volume) | `review_embeddings.npy` (float32), `review_embeddings_meta.csv` |
 
 ---
 
-## Stage 03 — Profile Aggregation
+## Stage 03 — Embedding Profile Aggregation
 
-**Script:** `03_profile_building/embedding/aggregation.py`
+**Scripts:** `03_profile_building/embedding/aggregation.py`, `build_profiles.py`, `profile_labels.py`
 
-Pools per-review vectors into one centroid per business and per user, then folds in a
-fallback for anything under-reviewed. A single shared weight function drives both this
-stage and Stage 04, so a strategy swap (`"mean"` ↔ `"recency"`) never lets the label and
-the vector describe different things.
-
-### 3a — Centroid (`build_group_profiles()`)
-
-| | |
-|---|---|
-| Input | `review_embeddings.npy`, `review_embeddings_meta.csv` |
-| Script | `compute_review_weights()` — mean = uniform · recency = `1/(1+days/30)` |
-| Output | `emb_0…emb_383` + `n_reviews, low_confidence` |
-
-### 3b — Cold-Start Blend (`blend_with_category_prior()`)
+Pools per-review embeddings into one centroid per business/user (same mean/recency
+weighting convention as Stage 01's TF-IDF aggregation), plus a category-prior cold-start
+blend for under-reviewed groups (inert on the current review-count floors) and a
+TF-IDF-derived top-terms label for interpretability, since raw embedding dimensions
+carry no human meaning.
 
 | | |
 |---|---|
-| Input | `low_confidence` rows (`n_reviews < 5` biz / `< 3` user), `categories` (raw Yelp tags, business only) |
-| Script | `blend_with_category_prior()` — swappable `weight_fn` + `category_key_fn` |
-| Output | blended `emb_` cols — low-confidence rows only — currently 0 in this corpus |
+| Input | `review_embeddings.npy`/`_meta.csv`, review text (managed table) |
+| Script | `build_group_profiles()`, `blend_with_category_prior()`, `profile_labels.build_group_labels()` |
+| Output (Volume) | `business_embeddings.csv`, `user_embeddings.csv` — `emb_0…emb_383, n_reviews, low_confidence, label` |
 
 ---
 
-## Stage 04 — Interpretability Labels
+## Stage 04 — Live Query Matching & Similarity Scoring *(runs live, per request)*
 
-**Script:** `03_profile_building/embedding/profile_labels.py`
+**Scripts:** `04_scoring/similarity_tfidf.py`, `similarity_embedding.py`, `query_matching.py`
 
-None of the 384 embedding dimensions carry human meaning, unlike LDA's named topic
-columns. This stage fits one TF-IDF vectorizer over the full corpus, sums each group's
-*weighted* TF-IDF rows in a single sparse matmul (same weights as 3a, every review, not
-a nearest-to-centroid sample) and keeps the top terms as a plain-language label.
-
-| | |
-|---|---|
-| Input | `philly_reviews.parquet` (`text`), `review_embeddings_meta.csv` |
-| Script | `fit_tfidf()` — 20k features, uni+bigrams<br>`build_group_labels()` — weighted sparse matmul, top-6 terms |
-| Output | `label` — e.g. *"market, terminal, vendors, reading terminal, food, produce"* |
-
----
-
-## Stage 05 — Similarity Scoring *(runs live)*
-
-**Script:** `04_scoring/similarity_embedding.py`
-
-The one stage that runs live, per request: a user vector against the full business
-matrix, one dot product — valid only because every vector was pre-normalized back in
-Stage 02.
+The part that runs at request time. A user's historical TF-IDF profile (optionally
+blended with their embedding profile) is compared against every business via cosine
+similarity — the pre-computed part. A live free-text prompt is vectorized on the spot
+with the *same* fitted TF-IDF vectorizer and embedding model (never re-fit), matched
+against business profiles the same way, then blended with the historical match —
+weighted toward the live prompt (`prompt_weight=0.75` by default), since an explicit ask
+should outweigh general taste history.
 
 | | |
 |---|---|
-| Input | `business_embeddings.csv` (matrix), `user_embeddings.csv` (one row) |
-| Script | `cosine_similarity_via_dot()` |
+| Input | `business/user_tfidf_profiles.npz`, `business/user_embeddings.csv`, live query text |
+| Script | `cosine_similarity_via_dot()` (tfidf + embedding) · `match_prompt_to_businesses()` · `blend_prompt_and_profile()` |
 | Output | score per business — computed live, not persisted |
 
 ---
 
-## Stage 06 — Evaluation
+## Stage 05 — Evaluation
 
 **Script:** `05_evaluation/evaluate_recommender.py`
 
-An 80/20 leave-out harness — precision, recall, NDCG, hit-rate, MRR — reused as-is from
-the topic-model baseline, so the embedding signal is judged on the exact same eval set,
-not a new one.
+An 80/20 leave-out harness — Precision@K, Recall@K, NDCG@K, HitRate@K, MRR — comparing
+`tfidf`, `embedding`, `cbf` (the retired LDA+JSD baseline), `popularity`, and `random`
+arms on the same held-out split.
+
+| System | K | Precision | Recall | NDCG | HitRate | MRR |
+|---|---|---|---|---|---|---|
+| **tfidf** | 5 | **0.0263** | **0.0318** | **0.0361** | **0.1177** | **0.0648** |
+| **tfidf** | 10 | **0.0226** | **0.0573** | **0.0438** | **0.1830** | **0.0737** |
+| embedding | 5 | 0.0245 | 0.0308 | 0.0307 | 0.1089 | 0.0509 |
+| embedding | 10 | 0.0207 | 0.0529 | 0.0377 | 0.1695 | 0.0590 |
+| popularity | 5 | 0.0228 | 0.0289 | 0.0315 | 0.1037 | 0.0564 |
+| popularity | 10 | 0.0177 | 0.0417 | 0.0349 | 0.1493 | 0.0623 |
+| cbf (LDA+JSD, retired) | 5 | 0.0207 | 0.0262 | 0.0245 | 0.0975 | 0.0406 |
+| cbf (LDA+JSD, retired) | 10 | 0.0206 | 0.0515 | 0.0343 | 0.1742 | 0.0508 |
+| random | 5/10 | ~0.002 | ~0.005 | ~0.004 | ~0.02 | ~0.007 |
+
+*(Philadelphia dataset, from `eval_per_user.csv`. `tfidf` beats every other arm on every
+metric at both K=5 and K=10 — including `cbf`, despite `cbf` having a structural
+leakage advantage: its LDA model was trained once on the full corpus and never saved to
+disk, so it couldn't be retrained per evaluation fold the way `tfidf`/`embedding` were.
+This result is why TF-IDF is the primary method going forward, and why LDA was retired
+rather than carried over to New Orleans. These numbers have not yet been re-validated
+on the New Orleans dataset — re-running this stage once New Orleans profiles exist is
+an open task, not an assumption that the Philadelphia result automatically generalizes.)*
 
 | | |
 |---|---|
-| Input | `business/user_embeddings.csv` |
-| Script | `rank_embedding()` via `similarity.py` |
-| Output | `eval_per_user.csv`<br>NDCG@5 0.0322 · @10 0.0389 — mean strategy, beats LDA+JSD |
-
-> `rank_cbf()` — the pre-existing LDA + JSD baseline — runs in the same harness for
-> comparison, unchanged. Its topic model was trained once on the full corpus in
-> notebook 02 and isn't part of this pipeline.
+| Input | `business/user_tfidf_profiles.npz`, `business/user_embeddings.csv` |
+| Script | `evaluate_recommender.py` |
+| Output | `eval_per_user.csv` |
 
 ---
 
-## Stage 07 — Recommender *(terminal stage)*
+## Stage 06 — Recommender *(terminal stage)*
 
 **Script:** `06_recommender_app/app.py`
 
-Blends the embedding similarity score with the LDA/JSD score (`MinMaxScaler`),
-MMR-reranks the blend for diversity, and hands the final list to an LLM for a
-plain-language explanation — served in the Streamlit interface.
+Blends TF-IDF profile similarity (+ optional embedding blend) with live prompt matching
+(Stage 04), applies a `stars × log(1+review_count)` popularity prior, MMR-reranks for
+diversity, and hands the final list to an LLM (GPT-4o-mini) for a plain-language
+explanation — served in the Streamlit interface. Runs as a Databricks App (needs a live
+Spark session to read the managed table for business display metadata — name, address,
+categories, stars, review_count; business hours have no New Orleans data source yet).
 
 | | |
 |---|---|
-| Input | `business/user_embeddings.csv`, `business_profiles.csv` (LDA topics) |
-| Script | `recommend(scoring_method=…)` |
+| Input | `business/user_tfidf_profiles.npz`, `business/user_embeddings.csv`, managed table (business metadata), live query text |
+| Script | `recommend()` |
 | Output | ranked list + explanation — Streamlit |
 
 ---
 
 ## Legend
 
-- **Input** — file read
+- **Input** — file/table read
 - **Script** — transformation run
-- **Output** — file written
-- **Pre-existing path** — context only (not built in this pass)
+- **Output** — file/table written
 
 ## Source files
 
-`03_profile_building/embedding/embeddings.py` · `03_profile_building/embedding/aggregation.py` · `03_profile_building/embedding/profile_labels.py` ·
-`04_scoring/similarity_embedding.py` · `05_evaluation/evaluate_recommender.py` — additive to the pre-existing
-LDA + JSD pipeline (notebooks 01–02), which none of this replaces.
+`01_data_processing/01_data_processing.ipynb` ·
+`03_profile_building/tfidf/vectorize.py` · `build_profiles.py` · `aggregation.py` ·
+`03_profile_building/embedding/embeddings.py` · `aggregation.py` · `profile_labels.py` · `build_profiles.py` ·
+`04_scoring/similarity_tfidf.py` · `similarity_embedding.py` · `query_matching.py` ·
+`05_evaluation/evaluate_recommender.py` ·
+`06_recommender_app/app.py`

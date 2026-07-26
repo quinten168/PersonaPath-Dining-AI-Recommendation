@@ -3,28 +3,39 @@ PersonaPath — AI-Powered Dining Recommendations
 ================================================
 Version: 3.4.1 (Updated: 2026-04-24 07:22 AM)
 Run:
-    pip install streamlit pandas numpy scikit-learn openai requests plotly pydeck
+    pip install streamlit pandas numpy scikit-learn anthropic requests plotly pydeck
     streamlit run big_data.py
 """
 
 import json
 import csv
 import os
+import sys
 import time
 import urllib.parse
 from datetime import datetime
+from pathlib import Path
 
+import anthropic
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pydeck as pdk
 import requests
+import scipy.sparse as sp
 import streamlit as st
-from openai import OpenAI
+from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
-from scipy.spatial.distance import jensenshannon
+
+# 04_scoring/ isn't a package -- no relative-import mechanism, so anchor the
+# path off this file's location (same pattern as 05_evaluation/evaluate_recommender.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "04_scoring"))
+from similarity_tfidf import cosine_similarity_via_dot as tfidf_cosine_similarity
+from similarity_embedding import cosine_similarity_via_dot as embedding_cosine_similarity
+from query_matching import match_prompt_to_businesses, blend_prompt_and_profile
 
 st.set_page_config(page_title="PersonaPath", page_icon="🍽️", layout="wide", initial_sidebar_state="expanded")
 
@@ -191,40 +202,26 @@ div[data-testid="stChatInput"] > div { background-color: #ffffff !important; bor
 </style>
 """, unsafe_allow_html=True)
 
-OPENAI_API_KEY    = "ENTER"
+ANTHROPIC_API_KEY = "ENTER"
+ANTHROPIC_MODEL   = "claude-haiku-4-5"  # simple/cheap tier -- concierge text is not intelligence-sensitive
 GOOGLE_PLACES_KEY = "ENTER"
 FEEDBACK_FILE     = "feedback.csv"
 
-TOPIC_COLS = [
-    "bar_nightlife_crowd","bar_vibes_live_music","brunch_breakfast",
-    "cafe_coffee_reading_terminal","casual_payment_ordering","chef_specials_platters",
-    "cocktail_bars_speakeasy","comfort_food_sandwiches","craft_beer_sports_bars",
-    "customer_service_quality","desserts_bakery","dinner_happy_hour",
-    "fine_dining_tasting_menu","food_trucks_trendy_spots","markets_grocery_shopping",
-    "outdoor_street_seating","overall_food_quality","philly_neighborhood_gems",
-    "quick_fresh_lunch","service_wait_time","small_plates_cocktails",
-    "spicy_asian_flavors","unique_quirky_dining","value_portion_size",
-    "venue_location_experience",
-]
+# New Orleans profiles are TF-IDF-based (03_profile_building/tfidf/), not the
+# Philadelphia-era LDA business_profiles.csv/user_profiles.csv -- no discrete
+# topic taxonomy exists here, so TOPIC_COLS/TOPIC_LABELS are gone. See the
+# project plan for why topic modeling wasn't carried over.
+VOLUME_ROOT = "/Volumes/persona-path/default"
+TABLE_NAME  = "persona-path.default.new_orleans_reviews"
+TFIDF_VECTORIZER_PATH = f"{VOLUME_ROOT}/interim/tfidf_vectorizer.joblib"
+EMBEDDING_MODEL_NAME  = "all-MiniLM-L6-v2"
 
-TOPIC_LABELS = {
-    "bar_nightlife_crowd":"🍺 Bar & Nightlife","bar_vibes_live_music":"🎵 Live Music",
-    "brunch_breakfast":"🥞 Brunch","cafe_coffee_reading_terminal":"☕ Café & Coffee",
-    "casual_payment_ordering":"🧾 Casual Dining","chef_specials_platters":"👨‍🍳 Chef Specials",
-    "cocktail_bars_speakeasy":"🍸 Cocktails","comfort_food_sandwiches":"🥪 Comfort Food",
-    "craft_beer_sports_bars":"🏈 Sports Bar","customer_service_quality":"⭐ Great Service",
-    "desserts_bakery":"🧁 Desserts","dinner_happy_hour":"🌅 Happy Hour",
-    "fine_dining_tasting_menu":"🍷 Fine Dining","food_trucks_trendy_spots":"🚚 Food Trucks",
-    "markets_grocery_shopping":"🛒 Market","outdoor_street_seating":"🌿 Outdoor",
-    "overall_food_quality":"🍽️ Food Quality","philly_neighborhood_gems":"📍 Philly Gem",
-    "quick_fresh_lunch":"⚡ Quick Lunch","service_wait_time":"⏱️ Fast Service",
-    "small_plates_cocktails":"🫒 Small Plates","spicy_asian_flavors":"🌶️ Asian Flavors",
-    "unique_quirky_dining":"✨ Unique","value_portion_size":"💰 Great Value",
-    "venue_location_experience":"🏙️ Great Location",
-}
-
-ALPHA = 0.5
-BETA  = 0.3
+ALPHA         = 0.5   # profile+prompt similarity ("sims") vs. popularity prior
+PROMPT_WEIGHT = 0.75  # live prompt vs. historical profile, within "sims" --
+                      # see query_matching.blend_prompt_and_profile. Prompt
+                      # dominates by design: an explicit ask should outweigh
+                      # general taste history. Tune both against real query
+                      # examples, same as the rest of this blend.
 DAYS  = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
 
 # ── Embedding-based similarity (additive, alongside JSD) ──────────────────
@@ -248,26 +245,66 @@ FOOD_IMAGES = [
 
 @st.cache_data(show_spinner="Loading profiles…")
 def load_data():
-    b_path = "data/profiles/business_profiles.csv"
-    u_path = "data/profiles/user_profiles.csv"
-    return pd.read_csv(b_path), pd.read_csv(u_path)
+    """New Orleans profiles are TF-IDF-based (03_profile_building/tfidf/),
+    not the Philadelphia-era LDA business_profiles.csv/user_profiles.csv.
+
+    Business display metadata (name/address/categories/stars/review_count)
+    isn't produced by the TF-IDF pipeline, so it's pulled directly from the
+    same managed table the pipeline reads from, deduplicated to one row per
+    business. NOTE: hours aren't available for New Orleans -- they were
+    never selected into the `merged` view in 01_data_processing.ipynb -- so
+    format_hours() below will show every business as "Closed today" until
+    an hours source is added.
+
+    Requires a live Spark session (run as a Databricks App/notebook).
+    """
+    biz_meta  = pd.read_csv(f"{VOLUME_ROOT}/profiles/business_tfidf_profiles_meta.csv")
+    user_meta = pd.read_csv(f"{VOLUME_ROOT}/profiles/user_tfidf_profiles_meta.csv")
+    biz_tfidf_matrix  = sp.load_npz(f"{VOLUME_ROOT}/profiles/business_tfidf_profiles.npz")
+    user_tfidf_matrix = sp.load_npz(f"{VOLUME_ROOT}/profiles/user_tfidf_profiles.npz")
+
+    biz_info = spark.table(TABLE_NAME).select(
+        "business_id", "business_name", "address", "categories",
+        "business_stars", "review_count",
+    ).dropDuplicates(["business_id"]).toPandas()
+
+    # Left merge on biz_meta (whose row order matches biz_tfidf_matrix's rows)
+    # preserves that row order since biz_info is already deduplicated 1:1.
+    biz_df = biz_meta.merge(biz_info, on="business_id", how="left")
+    return biz_df, user_meta, biz_tfidf_matrix, user_tfidf_matrix
 
 
-@st.cache_data(show_spinner="Building vectors…")
+@st.cache_resource(show_spinner="Loading TF-IDF vectorizer + embedding model…")
+def load_query_models():
+    """Fitted TfidfVectorizer + sentence-transformer, loaded once and reused
+    for every live query -- see 04_scoring/query_matching.py. Cached with
+    st.cache_resource (not cache_data) since these are non-serializable
+    model objects."""
+    vectorizer = joblib.load(TFIDF_VECTORIZER_PATH)
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return vectorizer, model
+
+
+@st.cache_data(show_spinner="Computing popularity prior…")
 def build_matrix(business_df):
+    """Popularity prior (business_stars x log(1+review_count)), replacing
+    the Philadelphia-era sentiment x dominant_topic_score EAS term -- VADER
+    sentiment and LDA dominant-topic scores aren't available for New
+    Orleans (topic modeling wasn't carried over -- see the project plan)."""
     df = business_df.copy()
-    df["eas_norm"] = MinMaxScaler().fit_transform(df[["overall_sentiment"]].fillna(0))
-    return df, df[TOPIC_COLS].fillna(0).values
+    popularity = df["business_stars"].fillna(0) * np.log1p(df["review_count"].fillna(0))
+    df["eas_norm"] = MinMaxScaler().fit_transform(popularity.values.reshape(-1, 1))
+    return df
 
 
 @st.cache_data(show_spinner="Loading embeddings…")
 def load_embeddings():
-    """Additive, alongside the LDA topic vectors above. Returns (None, None)
+    """Additive, alongside the TF-IDF profiles above. Returns (None, None)
     if the embedding artifacts haven't been generated yet
     (03_profile_building/embedding/build_profiles.py) so the app degrades
-    gracefully to JSD-only rather than crashing."""
-    biz_path  = "data/profiles/business_embeddings.csv"
-    user_path = "data/profiles/user_embeddings.csv"
+    gracefully to TF-IDF-only rather than crashing."""
+    biz_path  = f"{VOLUME_ROOT}/profiles/business_embeddings.csv"
+    user_path = f"{VOLUME_ROOT}/profiles/user_embeddings.csv"
     if not (os.path.exists(biz_path) and os.path.exists(user_path)):
         return None, None
     return pd.read_csv(biz_path), pd.read_csv(user_path)
@@ -276,9 +313,9 @@ def load_embeddings():
 @st.cache_data(show_spinner="Building embedding vectors…")
 def build_embedding_matrix(business_emb_df, business_df):
     """Aligns business_embeddings rows to business_df's row order so the
-    resulting matrix indexes identically to biz_matrix (matrix[idx] with
-    idx = candidate.index). Missing coverage -> zero vector (inert fallback:
-    a zero vector always scores ~0 similarity, never crashes)."""
+    resulting matrix indexes identically to biz_tfidf_matrix (matrix[idx]
+    with idx = candidate.index). Missing coverage -> zero vector (inert
+    fallback: a zero vector always scores ~0 similarity, never crashes)."""
     if business_emb_df is None:
         return None
     aligned = business_df[["business_id"]].merge(business_emb_df, on="business_id", how="left")
@@ -286,9 +323,12 @@ def build_embedding_matrix(business_emb_df, business_df):
 
 
 def get_top3_topics(row):
-    scores = {c: float(row.get(c, 0)) for c in TOPIC_COLS}
-    top3   = sorted(scores, key=scores.get, reverse=True)[:3]
-    return [TOPIC_LABELS.get(t, t) for t in top3]
+    """Top-3 terms from this business's TF-IDF label (top-6 terms by
+    weight, computed in 03_profile_building/tfidf/build_profiles.py),
+    replacing the Philadelphia-era LDA topic-label tags."""
+    label = str(row.get("label", "") or "")
+    terms = [t.strip() for t in label.split(",") if t.strip()]
+    return terms[:3] if terms else ["Great Dining"]
 
 
 def format_hours(row):
@@ -352,7 +392,7 @@ def format_hours(row):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def geocode(name, address="", city="Philadelphia"):
+def geocode(name, address="", city="New Orleans"):
     try:
         q = urllib.parse.quote(f"{name}, {address}, {city}" if address else f"{name}, {city}")
         r = requests.get(
@@ -380,43 +420,35 @@ def _mmr_rerank(scores, matrix, top_k, lambda_=0.65):
     return selected
 
 
-def _verify_like(user_vec, user_tastes, biz_row, sim_score):
-    """Predict how likely the user is to actually enjoy this restaurant (0–1)."""
-    s_sim     = float(np.clip(sim_score, 0.0, 1.0))
-    biz_dom   = str(biz_row.get("dominant_topic", "")).strip()
-    s_persona = 1.0 if biz_dom and biz_dom in user_tastes else 0.0
-    s_sent    = float(np.clip((float(biz_row.get("overall_sentiment", 0) or 0) + 1) / 2, 0, 1))
-    prob = float(np.clip(0.60 * s_sim + 0.25 * s_persona + 0.15 * s_sent, 0, 1))
+def _verify_like(sim_score, biz_row):
+    """Predict how likely the user is to actually enjoy this restaurant (0-1).
+
+    Simplified from the Philadelphia version: persona-match (dominant_topic
+    membership) and VADER sentiment both depended on the LDA pipeline, which
+    wasn't carried over for New Orleans (see the project plan) -- so this
+    blends similarity with the business's own star rating only."""
+    s_sim   = float(np.clip(sim_score, 0.0, 1.0))
+    s_stars = float(np.clip(float(biz_row.get("business_stars", 0) or 0) / 5.0, 0, 1))
+    prob = float(np.clip(0.75 * s_sim + 0.25 * s_stars, 0, 1))
     return round(prob, 3)
 
 
-def _embedding_similarity(user_vec, biz_matrix_sub):
-    """Cosine similarity via dot product -- vectors are pre-normalized at
-    encode time (normalize_embeddings=True in eval/embeddings.py) and
-    re-normalized after mean-pooling, so a plain dot product IS cosine
-    similarity here. Mirrors the inline JSD block in recommend() below for
-    symmetry/readability."""
-    norm = np.linalg.norm(user_vec)
-    user_unit = user_vec / norm if norm > 0 else user_vec
-    return biz_matrix_sub @ user_unit
-
-
-def recommend(user_id, user_df, business_df, biz_matrix, user_query="", top_n=10, surprise=False,
-              scoring_method="jsd", emb_matrix=None, user_emb_df=None, hybrid_weight=HYBRID_WEIGHT):
+def recommend(user_id, user_meta, business_df, biz_tfidf_matrix, user_tfidf_matrix,
+              tfidf_vectorizer, embedding_model, user_query="", top_n=10, surprise=False,
+              emb_matrix=None, user_emb_df=None, hybrid_weight=HYBRID_WEIGHT,
+              prompt_weight=PROMPT_WEIGHT):
     # ── User lookup ──────────────────────────────────────────────────
-    cols = ["user_id","top_taste_1","top_taste_2","top_taste_3"] + TOPIC_COLS
-    avail    = [c for c in cols if c in user_df.columns]
-    user_row = user_df[user_df["user_id"] == user_id][avail].head(1)
-    if user_row.empty:
+    # user_meta's row order matches user_tfidf_matrix's rows (both saved
+    # together by 03_profile_building/tfidf/build_profiles.py) -- resolve
+    # by an explicit id->row lookup, never assume positional alignment with
+    # any other table (see that pipeline's aggregation.py docstring).
+    user_matches = user_meta.index[user_meta["user_id"] == user_id]
+    if len(user_matches) == 0:
         st.error(f"user_id '{user_id}' not found.")
         return pd.DataFrame()
+    user_row_idx = int(user_matches[0])
+    user_tfidf_vec = np.asarray(user_tfidf_matrix.getrow(user_row_idx).todense()).ravel()
 
-    user_vec_1d = user_row[TOPIC_COLS].fillna(0).values[0]
-    user_tastes = [
-        str(user_row["top_taste_1"].iloc[0] or "") if "top_taste_1" in user_row else "",
-        str(user_row["top_taste_2"].iloc[0] or "") if "top_taste_2" in user_row else "",
-        str(user_row["top_taste_3"].iloc[0] or "") if "top_taste_3" in user_row else "",
-    ]
     ql        = user_query.lower()
     candidate = business_df.copy()
 
@@ -434,76 +466,47 @@ def recommend(user_id, user_df, business_df, biz_matrix, user_query="", top_n=10
                 candidate = candidate[mask]
             break
 
-    # ── Layer 1: similarity (scoring_method: "jsd" | "embedding" | "hybrid") ──
-    idx            = candidate.index
-    biz_matrix_sub = biz_matrix[idx]
-    eps       = 1e-10
-    user_dist = user_vec_1d + eps
-    user_dist = user_dist / user_dist.sum()
-    jsd_sims = np.array([
-        1.0 - jensenshannon(user_dist, biz_vec + eps)
-        for biz_vec in biz_matrix_sub
-    ])
+    # ── Layer 1: historical profile similarity (TF-IDF primary, embedding optional blend) ──
+    idx = candidate.index
+    biz_tfidf_sub = biz_tfidf_matrix[idx]
+    tfidf_profile_sims = tfidf_cosine_similarity(user_tfidf_vec, biz_tfidf_sub)
 
-    if scoring_method == "jsd":
-        # Unchanged from the original JSD-only path -- default, no regression.
-        sims = jsd_sims
-        mmr_matrix_sub = biz_matrix_sub
-    else:
-        if emb_matrix is None or user_emb_df is None:
-            raise ValueError(
-                "scoring_method='%s' requires emb_matrix and user_emb_df "
-                "(see load_embeddings()/build_embedding_matrix())" % scoring_method
-            )
-        emb_matrix_sub = emb_matrix[idx]
+    emb_matrix_sub = emb_matrix[idx] if emb_matrix is not None else None
+    if emb_matrix_sub is not None and user_emb_df is not None:
         user_emb_row = user_emb_df[user_emb_df["user_id"] == user_id][EMBED_COLS]
-        embedding_sims = (
+        embedding_profile_sims = (
             np.zeros(len(idx)) if user_emb_row.empty
-            else _embedding_similarity(user_emb_row.values[0], emb_matrix_sub)
+            else embedding_cosine_similarity(user_emb_row.values[0], emb_matrix_sub)
         )
-        if scoring_method == "embedding":
-            sims, mmr_matrix_sub = embedding_sims, emb_matrix_sub
-        elif scoring_method == "hybrid":
-            jsd_norm = MinMaxScaler().fit_transform(jsd_sims.reshape(-1, 1)).ravel()
-            emb_norm = MinMaxScaler().fit_transform(embedding_sims.reshape(-1, 1)).ravel()
-            sims = hybrid_weight * jsd_norm + (1 - hybrid_weight) * emb_norm
-            mmr_matrix_sub = emb_matrix_sub
-        else:
-            raise ValueError(f"unknown scoring_method: {scoring_method!r}")
+        tfidf_norm = MinMaxScaler().fit_transform(tfidf_profile_sims.reshape(-1, 1)).ravel()
+        emb_norm   = MinMaxScaler().fit_transform(embedding_profile_sims.reshape(-1, 1)).ravel()
+        profile_sims   = hybrid_weight * tfidf_norm + (1 - hybrid_weight) * emb_norm
+        mmr_matrix_sub = emb_matrix_sub
+    else:
+        profile_sims   = tfidf_profile_sims
+        mmr_matrix_sub = biz_tfidf_sub
 
-    # ── Layer 2: Intent boost (expanded) ─────────────────────────────
-    boost = pd.Series(0.0, index=idx)
-    romantic = any(w in ql for w in ["romantic","date","dating","couple","intimate","cozy",
-                                      "girlfriend","boyfriend","partner","anniversary","propose"])
-    if romantic:
-        boost += candidate["romantic_score"] * 2
-        if any(w in ql for w in ["quiet","private","talk"]):
-            boost += candidate["romantic_score"] * 1
-    if any(w in ql for w in ["friend","group","beer","party","night","drink",
-                               "birthday","celebrate","crew","bachelor","gathering"]):
-        boost += candidate["group_celebration_score"] * 2
-    if any(w in ql for w in ["family","kid","brunch","casual","children","parents"]):
-        boost += candidate["family_score"] * 2
-    if any(w in ql for w in ["quiet","work","coffee","study","solo","cafe","laptop","focus"]):
-        boost += candidate["solo_work_score"] * 2
-    if any(w in ql for w in ["hidden","local","gem","unique","authentic","underrated"]) or surprise:
-        boost += candidate["hidden_gem_score"] * (4 if surprise else 2)
-    if any(w in ql for w in ["fine dining","fancy","upscale","tasting menu","splurge","omakase"]):
-        boost += candidate["fine_dining_tasting_menu"] * 1.5
-    if any(w in ql for w in ["quick","fast","cheap","budget","affordable","takeout"]):
-        boost += candidate["quick_fresh_lunch"] * 1.5
-    if any(w in ql for w in ["outdoor","patio","terrace","rooftop","outside","al fresco"]):
-        boost += candidate["outdoor_street_seating"] * 1.5
-    if any(w in ql for w in ["late night","cocktail","nightlife","speakeasy","happy hour"]):
-        boost += candidate["cocktail_bars_speakeasy"] * 1.5
-    if boost.max() > 0:
-        boost = boost / boost.max()
-    boost_vals = boost.clip(0, 1).values
+    # ── Layer 2: live free-text prompt match (replaces the old keyword-boost) ──
+    # See 04_scoring/query_matching.py: the prompt is vectorized with the SAME
+    # fitted vectorizer/model used to build the profiles, then blended with
+    # the historical profile similarity above, weighted toward the prompt.
+    if user_query.strip():
+        prompt_scores = match_prompt_to_businesses(
+            query_text=user_query,
+            tfidf_vectorizer=tfidf_vectorizer,
+            business_tfidf_matrix=biz_tfidf_sub,
+            embedding_model=embedding_model,
+            business_embedding_matrix=emb_matrix_sub,
+        )
+        sims = blend_prompt_and_profile(prompt_scores, profile_sims, prompt_weight=prompt_weight)
+    else:
+        sims = profile_sims
 
-    # ── Layer 3: Final score ─────────────────────────────────────────
-    scores = ALPHA * sims + max(1-ALPHA-BETA, 0) * candidate["eas_norm"].values + BETA * boost_vals
     if surprise:
-        scores = scores * 0.6 + np.random.uniform(0, 0.15, size=scores.shape)
+        sims = sims * 0.6 + np.random.uniform(0, 0.15, size=sims.shape)
+
+    # ── Layer 3: final score (profile+prompt similarity vs. popularity prior) ──
+    scores = ALPHA * sims + (1 - ALPHA) * candidate["eas_norm"].values
 
     # ── Layer 4: MMR reranking ───────────────────────────────────────
     pool_size = min(top_n * 3, len(scores))
@@ -513,49 +516,39 @@ def recommend(user_id, user_df, business_df, biz_matrix, user_query="", top_n=10
 
     res = candidate.iloc[final_idx].copy()
     res["name"]              = res["business_name"]
-    res["city"]              = "Philadelphia"
+    res["city"]              = "New Orleans"
     res["stars"]             = res["business_stars"]
-    res["dominant_vibe"]     = res.get("dominant_topic", "Great Dining")
-    res["avg_sentiment"]     = res["overall_sentiment"] if "overall_sentiment" in res.columns else 0.5
-    res["intent_romantic"]   = res["romantic_score"]
-    res["intent_solo_work"]  = res["solo_work_score"]
-    res["intent_family"]     = res["family_score"]
-    res["intent_group"]      = res["group_celebration_score"]
-    res["intent_hidden_gem"] = res["hidden_gem_score"]
+    res["dominant_vibe"]     = res["label"].fillna("Great Dining") if "label" in res.columns else "Great Dining"
     res["similarity_score"]  = sims[final_idx]
-    res["query_boost"]       = boost_vals[final_idx]
     res["eas_norm"]          = candidate["eas_norm"].values[final_idx]
     res["final_score"]       = scores[final_idx]
 
     # ── Layer 5: verify_like ─────────────────────────────────────────
     res["predicted_like_prob"] = [
-        _verify_like(user_vec_1d, user_tastes, row, row["similarity_score"])
-        for _, row in res.iterrows()
+        _verify_like(row["similarity_score"], row) for _, row in res.iterrows()
     ]
 
     return res.reset_index(drop=True)
 
 
-def _client(): return OpenAI(api_key=OPENAI_API_KEY)
-def has_key(): return OPENAI_API_KEY and not OPENAI_API_KEY.startswith("YOUR_")
+def _client(): return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+def has_key(): return ANTHROPIC_API_KEY and not ANTHROPIC_API_KEY.startswith("YOUR_")
 
 
 def call_briefing(top_k, user_query):
     if not has_key(): return ""
     names = ", ".join(top_k["name"].tolist()[:5])
     try:
-        r = _client().chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":"You are PersonaPath, a refined dining concierge."},
-                {"role":"user","content":(
-                    f'User asked: "{user_query}". Shortlisted: {names}. '
-                    "Write 2 elegant sentences explaining why these picks suit the request. Mention restaurant names."
-                )},
-            ],
+        r = _client().messages.create(
+            model=ANTHROPIC_MODEL,
             max_tokens=140, temperature=0.7,
+            system="You are PersonaPath, a refined dining concierge.",
+            messages=[{"role":"user","content":(
+                f'User asked: "{user_query}". Shortlisted: {names}. '
+                "Write 2 elegant sentences explaining why these picks suit the request. Mention restaurant names."
+            )}],
         )
-        return r.choices[0].message.content.strip()
+        return next(b.text for b in r.content if b.type == "text").strip()
     except Exception:
         return ""
 
@@ -564,52 +557,87 @@ def call_card_reasons(top_k, user_query):
     if not has_key(): return {}
     candidates = [{"name":r["name"],"categories":r["categories"],"stars":r["stars"],"dominant_vibe":r["dominant_vibe"]} for _,r in top_k.iterrows()]
     try:
-        resp = _client().chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":(
-                    "You are PersonaPath. For each restaurant write ONE vivid sentence (max 18 words) "
-                    "explaining why it matches. "
-                    'Return ONLY valid JSON: {"recommendations":[{"name":"...","reason":"..."}]}'
-                )},
-                {"role":"user","content":f'Request: "{user_query}"\n\nCandidates: {candidates}'},
-            ],
+        resp = _client().messages.create(
+            model=ANTHROPIC_MODEL,
             max_tokens=500, temperature=0.7,
-            response_format={"type":"json_object"},
+            system=(
+                "You are PersonaPath. For each restaurant write ONE vivid sentence (max 18 words) "
+                "explaining why it matches."
+            ),
+            messages=[{"role":"user","content":f'Request: "{user_query}"\n\nCandidates: {candidates}'}],
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "recommendations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "reason": {"type": "string"},
+                                    },
+                                    "required": ["name", "reason"],
+                                    "additionalProperties": False,
+                                },
+                            }
+                        },
+                        "required": ["recommendations"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
         )
-        recs = json.loads(resp.choices[0].message.content).get("recommendations",[])
+        text = next(b.text for b in resp.content if b.type == "text")
+        recs = json.loads(text).get("recommendations", [])
         return {r["name"]: r["reason"] for r in recs}
     except Exception:
         return {}
 
 
 def call_followup(conversation, top_k, user_message):
-    if not has_key(): return "Please add your OpenAI key."
+    if not has_key(): return "Please add your Anthropic key."
     summary = top_k[["name","categories","stars","dominant_vibe"]].to_dict("records")
-    messages = [{"role":"system","content":(f"You are PersonaPath, a dining concierge. Shortlist: {summary}. Answer in 2-3 sentences.")}] + conversation + [{"role":"user","content":user_message}]
+    messages = conversation + [{"role":"user","content":user_message}]
     try:
-        r = _client().chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=200, temperature=0.7)
-        return r.choices[0].message.content.strip()
+        r = _client().messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=200, temperature=0.7,
+            system=f"You are PersonaPath, a dining concierge. Shortlist: {summary}. Answer in 2-3 sentences.",
+            messages=messages,
+        )
+        return next(b.text for b in r.content if b.type == "text").strip()
     except Exception as e:
         return f"Error: {e}"
 
 
-def radar_chart(user_df, user_id):
-    row = user_df[user_df["user_id"] == user_id][TOPIC_COLS].fillna(0)
-    if row.empty: return None
-    vals   = row.values[0]
-    top8   = np.argsort(vals)[-8:][::-1]
-    labels = [TOPIC_LABELS.get(TOPIC_COLS[i], TOPIC_COLS[i]) for i in top8]
-    v      = vals[top8].tolist() + [vals[top8[0]]]
-    labels = labels + [labels[0]]
-    fig = go.Figure(go.Scatterpolar(r=v, theta=labels, fill="toself",
-        fillcolor="rgba(192,57,43,0.12)", line=dict(color="#c0392b", width=2)))
+def radar_chart(user_meta, user_tfidf_matrix, tfidf_vectorizer, user_id):
+    """Horizontal bar of this user's top TF-IDF terms by weight -- replaces
+    the Philadelphia-era LDA topic-score radar chart (no discrete topic
+    taxonomy exists for New Orleans; see the project plan)."""
+    matches = user_meta.index[user_meta["user_id"] == user_id]
+    if len(matches) == 0:
+        return None
+    row = user_tfidf_matrix.getrow(int(matches[0])).tocsr()
+    if row.nnz == 0:
+        return None
+
+    feature_names = np.asarray(tfidf_vectorizer.get_feature_names_out())
+    top_n = min(8, row.nnz)
+    top_local = np.argpartition(-row.data, top_n - 1)[:top_n]
+    top_local = top_local[np.argsort(row.data[top_local])]  # ascending: highest weight at top of the bar
+    terms   = feature_names[row.indices[top_local]]
+    weights = row.data[top_local]
+
+    fig = go.Figure(go.Bar(x=weights, y=terms, orientation="h", marker=dict(color="#c0392b")))
     fig.update_layout(
-        polar=dict(bgcolor="#111", radialaxis=dict(visible=True, range=[0,max(v)*1.15],
-            gridcolor="#2a2a2a", tickfont=dict(color="#555",size=9)),
-            angularaxis=dict(tickfont=dict(color="#c8b89a",size=10))),
-        paper_bgcolor="#0e0e0e", height=320,
-        margin=dict(l=50,r=50,t=40,b=40), showlegend=False,
+        paper_bgcolor="#0e0e0e", plot_bgcolor="#0e0e0e", height=320,
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis=dict(color="#888", showgrid=False, title="TF-IDF weight"),
+        yaxis=dict(color="#c8b89a"),
+        showlegend=False,
     )
     return fig
 
@@ -640,7 +668,7 @@ def map_view(top_k, places: dict):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def enrich_places(name: str, city: str = "Philadelphia") -> dict:
+def enrich_places(name: str, city: str = "New Orleans") -> dict:
     if not GOOGLE_PLACES_KEY or GOOGLE_PLACES_KEY.startswith("YOUR_"): return {}
     try:
         q = urllib.parse.quote(f"{name} {city}")
@@ -693,7 +721,7 @@ def render_card(row, rank, reason, user_id, pd_data: dict):
     name, stars, addr = row["name"], row["stars"], str(row.get("address","")).strip()
     top3, hours = get_top3_topics(row), format_hours(row)
     star_str = "★" * min(int(round(stars)),5) + "☆" * (5 - min(int(round(stars)),5))
-    maps_url = f"https://www.google.com/maps/search/?q={urllib.parse.quote(name+' Philadelphia')}"
+    maps_url = f"https://www.google.com/maps/search/?q={urllib.parse.quote(name+' New Orleans')}"
     
     # Enrichment
     p_url, g_ph = pd_data.get("photo_url", ""), pd_data.get("phone", "")
@@ -724,7 +752,7 @@ def render_card(row, rank, reason, user_id, pd_data: dict):
         ct += f'<div style="flex:1;">'
         ct += f'<div class="card-name"><span class="card-rank">{rank}</span>{name}</div>'
         ct += f'<div class="card-meta">'
-        ct += f'<span style="color:#c0392b;">{star_str}</span>&nbsp;{stars}&nbsp;&middot;&nbsp;Philadelphia{addr_html}'
+        ct += f'<span style="color:#c0392b;">{star_str}</span>&nbsp;{stars}&nbsp;&middot;&nbsp;New Orleans{addr_html}'
         ct += f'</div>'
         ct += f'<div style="margin:5px 0 8px;">{open_html}{price_html}{g_rating_html}{phone_html}</div>'
         ct += f'<div style="margin:8px 0;">{topics_html}</div>'
@@ -772,12 +800,13 @@ def main():
         st.markdown('<div style="text-align: center; padding: 10px 0;"><h1 style="color: #c0392b; margin:0; font-size: 1.8rem; letter-spacing: -1px;">PersonaPath</h1><p style="color: #887a6a; font-size: 0.78rem; margin: 4px 0 0; letter-spacing: 0.5px;">Dining curated for you.</p></div>', unsafe_allow_html=True)
         
         # Profile Switcher
+        # NOTE: the Philadelphia preset user_ids don't exist in the New
+        # Orleans data -- there's no equivalent set of IDs yet since the
+        # pipeline hasn't been run against real New Orleans data. Defaulting
+        # to Custom Token only, until real user_tfidf_profiles_meta.csv IDs
+        # are available to fill this back in.
         st.markdown('<p class="sb-label">👤 Dining Profile</p>', unsafe_allow_html=True)
         PRESETS = {
-            "🍜 The Foodie"   : "11XTXYmhkEFo7SwEb2ByCQ",
-            "🕯️ Date Night"  : "GSDw9czWBk_GL53a5NtcIg",
-            "🥂 Group Hangout": "V6BrQCclOjOwkJNVqMFNEg",
-            "☕ Solo Explorer": "acMsMOJ-FJtl6mPYCkbQ_g",
             "🛠️ Custom Token" : "CUSTOM"
         }
         persona = st.selectbox("Select Active Persona", list(PRESETS.keys()), label_visibility="collapsed")
@@ -826,7 +855,7 @@ def main():
     # ── 2. HERO SECTION ───────────────────────────────────────────────
     st.markdown("""
         <div class="hero-wrap">
-            <div class="hero-eyebrow">THE ORACLE &nbsp;·&nbsp; PHILADELPHIA</div>
+            <div class="hero-eyebrow">THE ORACLE &nbsp;·&nbsp; NEW ORLEANS</div>
             <div class="hero-title">Find Your PersonaPath</div>
             <div class="hero-tagline">
                 AI-Driven Dining Curation for Your Culinary Scenes.
@@ -836,14 +865,16 @@ def main():
 
     # ── 3. DATA & STATE ───────────────────────────────────────────────
     try:
-        biz_raw, u_df = load_data()
-        biz_df, b_mat = build_matrix(biz_raw)
+        biz_raw, user_meta, biz_tfidf_matrix, user_tfidf_matrix = load_data()
+        biz_df = build_matrix(biz_raw)
+        tfidf_vectorizer, embedding_model = load_query_models()
     except Exception as e:
         st.error(f"Data link failure: {e}"); return
 
     # Embedding-based similarity is additive: if the artifacts don't exist yet
-    # (eval/embeddings.py hasn't been run), the app still works exactly as
-    # before with scoring_method="jsd" (the default below).
+    # (03_profile_building/embedding/build_profiles.py hasn't been run), the
+    # app still works, TF-IDF-only, on both historical-profile similarity
+    # and live-prompt matching (see query_matching.match_prompt_to_businesses).
     try:
         biz_emb_raw, u_emb_df = load_embeddings()
         emb_mat = build_embedding_matrix(biz_emb_raw, biz_df)
@@ -861,8 +892,10 @@ def main():
         st.session_state.user_id      = user_id
         st.session_state.user_query   = full_query
         with st.spinner("Calculating culinary vectors…"):
-            top_k = recommend(user_id=user_id, user_df=u_df, business_df=biz_df,
-                               biz_matrix=b_mat, user_query=full_query, top_n=top_n, surprise=surprise,
+            top_k = recommend(user_id=user_id, user_meta=user_meta, business_df=biz_df,
+                               biz_tfidf_matrix=biz_tfidf_matrix, user_tfidf_matrix=user_tfidf_matrix,
+                               tfidf_vectorizer=tfidf_vectorizer, embedding_model=embedding_model,
+                               user_query=full_query, top_n=top_n, surprise=surprise,
                                emb_matrix=emb_mat, user_emb_df=u_emb_df)
         
         if not top_k.empty:
@@ -902,7 +935,7 @@ def main():
 
         with t2:
             st.markdown('<p class="section-label">Your Culinary Fingerprint</p>', unsafe_allow_html=True)
-            fig = radar_chart(u_df, uid)
+            fig = radar_chart(user_meta, user_tfidf_matrix, tfidf_vectorizer, uid)
             if fig: st.plotly_chart(fig, use_container_width=True)
 
         with t3:

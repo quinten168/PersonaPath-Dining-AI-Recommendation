@@ -1,5 +1,5 @@
 """
-Fit a single global TF-IDF vectorizer over every Philadelphia review and
+Fit a single global TF-IDF vectorizer over every New Orleans review and
 transform the corpus into a sparse per-review TF-IDF matrix.
 
 This is the TF-IDF pipeline's counterpart to
@@ -19,13 +19,18 @@ meaningless dimensions). TF-IDF profiles are interpretable by construction
 semantic matching (synonyms/paraphrases score no similarity). This pipeline
 exists to evaluate that trade-off, not to replace the embedding pipeline.
 
-Input:  ../../data/interim/philly_reviews.parquet   (from 01_data_processing/prep_reviews.py)
-Output:
-    ../../data/interim/review_tfidf.npz          (scipy sparse CSR, n_reviews x n_features)
-    ../../data/interim/review_tfidf_meta.csv     (review_id, business_id, user_id,
-                                                    stars, date -- same row order as the .npz)
-    ../../data/interim/tfidf_vectorizer.joblib   (fitted TfidfVectorizer, for
-                                                    feature names + future reuse)
+Input:  persona-path.default.new_orleans_reviews   (Unity Catalog managed table,
+                                                     from 01_data_processing/01_data_processing.ipynb)
+Output (Unity Catalog Volume, so these survive past this job's cluster):
+    /Volumes/persona-path/default/interim/review_tfidf.npz          (scipy sparse CSR, n_reviews x n_features)
+    /Volumes/persona-path/default/interim/review_tfidf_meta.csv     (review_id, business_id, user_id,
+                                                                       stars, date -- same row order as the .npz)
+    /Volumes/persona-path/default/interim/tfidf_vectorizer.joblib   (fitted TfidfVectorizer, for
+                                                                       feature names + future reuse)
+
+Requires a live Spark session (run as a Databricks notebook/job) -- reads
+via spark.table(), not a local file, so this can no longer run as a plain
+`python3 vectorize.py`.
 
 Vectorizer settings (max_features=20000, ngram_range=(1,2), English stopwords)
 match the embedding pipeline's label-generation TF-IDF
@@ -38,15 +43,15 @@ import pandas as pd
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-ROOT = "../.."  # run this script from inside 03_profile_building/tfidf/
-REVIEWS_PARQUET = f"{ROOT}/data/interim/philly_reviews.parquet"
+TABLE_NAME = "persona-path.default.new_orleans_reviews"
+VOLUME_ROOT = "/Volumes/persona-path/default"
 
 MAX_TFIDF_FEATURES = 20000
 TFIDF_NGRAM_RANGE = (1, 2)
 
-OUT_REVIEW_TFIDF_NPZ = f"{ROOT}/data/interim/review_tfidf.npz"
-OUT_REVIEW_TFIDF_META = f"{ROOT}/data/interim/review_tfidf_meta.csv"
-OUT_VECTORIZER = f"{ROOT}/data/interim/tfidf_vectorizer.joblib"
+OUT_REVIEW_TFIDF_NPZ = f"{VOLUME_ROOT}/interim/review_tfidf.npz"
+OUT_REVIEW_TFIDF_META = f"{VOLUME_ROOT}/interim/review_tfidf_meta.csv"
+OUT_VECTORIZER = f"{VOLUME_ROOT}/interim/tfidf_vectorizer.joblib"
 
 
 def fit_tfidf(texts, max_features=MAX_TFIDF_FEATURES, ngram_range=TFIDF_NGRAM_RANGE):
@@ -63,11 +68,10 @@ def fit_tfidf(texts, max_features=MAX_TFIDF_FEATURES, ngram_range=TFIDF_NGRAM_RA
 
 
 def main():
-    print(f"Loading review corpus: {REVIEWS_PARQUET}")
-    df = pd.read_parquet(
-        REVIEWS_PARQUET,
-        columns=["review_id", "business_id", "user_id", "stars", "date", "text"],
-    )
+    print(f"Loading review corpus: {TABLE_NAME}")
+    df = spark.table(TABLE_NAME).select(
+        "review_id", "business_id", "user_id", "stars", "date", "text",
+    ).toPandas()
     df["text"] = df["text"].fillna("")
     print(f"  {len(df):,} reviews")
 

@@ -27,9 +27,10 @@ def fit_tfidf(texts, max_features=20000, ngram_range=(1, 2)):
     """One TfidfVectorizer over the full review corpus (one global
     vocabulary/IDF) so business and user labels are on the same scale."""
     vectorizer = TfidfVectorizer(
-        max_features=max_features, ngram_range=ngram_range,
-        stop_words="english", lowercase=True,
-    )
+                    max_features=max_features, 
+                    ngram_range=ngram_range,
+                    stop_words="english", 
+                    lowercase=True)
     matrix = vectorizer.fit_transform(texts)
     return vectorizer, matrix
 
