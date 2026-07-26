@@ -12,7 +12,7 @@ FileStore / Delta Lake in the full pipeline.
 | Folder | Contents |
 | :--- | :--- |
 | `raw/` | Unmodified Yelp Open Dataset exports (`yelp_academic_dataset_*.json`), the dataset's user agreement. |
-| `interim/` | Generated intermediates: filtered Philadelphia review corpus (`philly_reviews.parquet`), per-review embedding/TF-IDF matrices and their metadata. Reproducible from `raw/` via the `01_data_processing/` and `03_profile_building/` scripts. |
+| `interim/` | Generated intermediates: filtered Philadelphia review corpus (`philly_reviews.parquet`), per-review embedding/TF-IDF matrices and their metadata. Reproducible from `raw/` via the `01_data_processing/` and `02_profile_building/` scripts. |
 | `profiles/` | Final per-business and per-user profile outputs consumed by scoring and evaluation — `business_profiles.csv`/`user_profiles.csv` (LDA topic vectors), `business_embeddings.csv`/`user_embeddings.csv` (sentence-embedding centroids), and the TF-IDF equivalents. |
 | `schema/` | Human-readable schema docs for the profile tables (below). |
 

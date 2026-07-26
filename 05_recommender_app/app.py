@@ -2,9 +2,11 @@
 PersonaPath — AI-Powered Dining Recommendations
 ================================================
 Version: 3.4.1 (Updated: 2026-04-24 07:22 AM)
-Run:
-    pip install streamlit pandas numpy scikit-learn anthropic requests plotly pydeck
-    streamlit run big_data.py
+Run (as a Databricks App / notebook with a live Spark session -- see
+load_data()'s docstring; a plain local `streamlit run` will fail on the
+spark.table() call):
+    pip install streamlit pandas numpy scikit-learn anthropic requests plotly pydeck sentence-transformers joblib scipy
+    streamlit run app.py
 """
 
 import json
@@ -30,9 +32,9 @@ from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
 
-# 04_scoring/ isn't a package -- no relative-import mechanism, so anchor the
-# path off this file's location (same pattern as 05_evaluation/evaluate_recommender.py).
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "04_scoring"))
+# 03_scoring/ isn't a package -- no relative-import mechanism, so anchor the
+# path off this file's location (same pattern as 04_evaluation/evaluate_recommender.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "03_scoring"))
 from similarity_tfidf import cosine_similarity_via_dot as tfidf_cosine_similarity
 from similarity_embedding import cosine_similarity_via_dot as embedding_cosine_similarity
 from query_matching import match_prompt_to_businesses, blend_prompt_and_profile
@@ -207,7 +209,7 @@ ANTHROPIC_MODEL   = "claude-haiku-4-5"  # simple/cheap tier -- concierge text is
 GOOGLE_PLACES_KEY = "ENTER"
 FEEDBACK_FILE     = "feedback.csv"
 
-# New Orleans profiles are TF-IDF-based (03_profile_building/tfidf/), not the
+# New Orleans profiles are TF-IDF-based (02_profile_building/tfidf/), not the
 # Philadelphia-era LDA business_profiles.csv/user_profiles.csv -- no discrete
 # topic taxonomy exists here, so TOPIC_COLS/TOPIC_LABELS are gone. See the
 # project plan for why topic modeling wasn't carried over.
@@ -245,7 +247,7 @@ FOOD_IMAGES = [
 
 @st.cache_data(show_spinner="Loading profiles…")
 def load_data():
-    """New Orleans profiles are TF-IDF-based (03_profile_building/tfidf/),
+    """New Orleans profiles are TF-IDF-based (02_profile_building/tfidf/),
     not the Philadelphia-era LDA business_profiles.csv/user_profiles.csv.
 
     Business display metadata (name/address/categories/stars/review_count)
@@ -277,7 +279,7 @@ def load_data():
 @st.cache_resource(show_spinner="Loading TF-IDF vectorizer + embedding model…")
 def load_query_models():
     """Fitted TfidfVectorizer + sentence-transformer, loaded once and reused
-    for every live query -- see 04_scoring/query_matching.py. Cached with
+    for every live query -- see 03_scoring/query_matching.py. Cached with
     st.cache_resource (not cache_data) since these are non-serializable
     model objects."""
     vectorizer = joblib.load(TFIDF_VECTORIZER_PATH)
@@ -301,7 +303,7 @@ def build_matrix(business_df):
 def load_embeddings():
     """Additive, alongside the TF-IDF profiles above. Returns (None, None)
     if the embedding artifacts haven't been generated yet
-    (03_profile_building/embedding/build_profiles.py) so the app degrades
+    (02_profile_building/embedding/build_profiles.py) so the app degrades
     gracefully to TF-IDF-only rather than crashing."""
     biz_path  = f"{VOLUME_ROOT}/profiles/business_embeddings.csv"
     user_path = f"{VOLUME_ROOT}/profiles/user_embeddings.csv"
@@ -324,7 +326,7 @@ def build_embedding_matrix(business_emb_df, business_df):
 
 def get_top3_topics(row):
     """Top-3 terms from this business's TF-IDF label (top-6 terms by
-    weight, computed in 03_profile_building/tfidf/build_profiles.py),
+    weight, computed in 02_profile_building/tfidf/build_profiles.py),
     replacing the Philadelphia-era LDA topic-label tags."""
     label = str(row.get("label", "") or "")
     terms = [t.strip() for t in label.split(",") if t.strip()]
@@ -439,7 +441,7 @@ def recommend(user_id, user_meta, business_df, biz_tfidf_matrix, user_tfidf_matr
               prompt_weight=PROMPT_WEIGHT):
     # ── User lookup ──────────────────────────────────────────────────
     # user_meta's row order matches user_tfidf_matrix's rows (both saved
-    # together by 03_profile_building/tfidf/build_profiles.py) -- resolve
+    # together by 02_profile_building/tfidf/build_profiles.py) -- resolve
     # by an explicit id->row lookup, never assume positional alignment with
     # any other table (see that pipeline's aggregation.py docstring).
     user_matches = user_meta.index[user_meta["user_id"] == user_id]
@@ -487,16 +489,24 @@ def recommend(user_id, user_meta, business_df, biz_tfidf_matrix, user_tfidf_matr
         mmr_matrix_sub = biz_tfidf_sub
 
     # ── Layer 2: live free-text prompt match (replaces the old keyword-boost) ──
-    # See 04_scoring/query_matching.py: the prompt is vectorized with the SAME
-    # fitted vectorizer/model used to build the profiles, then blended with
+    # See 03_scoring/query_matching.py: the prompt is vectorized with the SAME
+    # fitted TF-IDF vectorizer used to build the profiles, then blended with
     # the historical profile similarity above, weighted toward the prompt.
+    #
+    # TF-IDF-only for the live query, deliberately -- not blended with the
+    # embedding model here. Businesses have a review_count>=50 floor (see
+    # 01_data_processing/01_data_processing.ipynb), so common review
+    # vocabulary (romantic, cozy, quiet, patio, ...) has decent odds of
+    # appearing literally somewhere in that pool; the embedding pass mainly
+    # buys paraphrase coverage on less common phrasing, which is a real but
+    # narrower gap than "TF-IDF alone is unreliable." Revisit with
+    # embedding_model=embedding_model, business_embedding_matrix=emb_matrix_sub
+    # if real queries show literal-match misses that matter.
     if user_query.strip():
         prompt_scores = match_prompt_to_businesses(
             query_text=user_query,
             tfidf_vectorizer=tfidf_vectorizer,
             business_tfidf_matrix=biz_tfidf_sub,
-            embedding_model=embedding_model,
-            business_embedding_matrix=emb_matrix_sub,
         )
         sims = blend_prompt_and_profile(prompt_scores, profile_sims, prompt_weight=prompt_weight)
     else:
@@ -872,7 +882,7 @@ def main():
         st.error(f"Data link failure: {e}"); return
 
     # Embedding-based similarity is additive: if the artifacts don't exist yet
-    # (03_profile_building/embedding/build_profiles.py hasn't been run), the
+    # (02_profile_building/embedding/build_profiles.py hasn't been run), the
     # app still works, TF-IDF-only, on both historical-profile similarity
     # and live-prompt matching (see query_matching.match_prompt_to_businesses).
     try:

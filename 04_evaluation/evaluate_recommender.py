@@ -12,7 +12,7 @@ Systems compared:
   - cbf         : cosine similarity over LDA topic vectors + EAS (original system)
   - embedding   : cosine similarity over sentence-transformer review embeddings + EAS (additive)
   - tfidf       : cosine similarity over TF-IDF review-term vectors + EAS (additive,
-                  standalone pipeline -- see 03_profile_building/tfidf/)
+                  standalone pipeline -- see 02_profile_building/tfidf/)
   - popularity  : stars x log(1+review_count), no personalization
   - random      : sanity floor
 
@@ -48,14 +48,14 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # No package structure in this repo (flat scripts run via `python3 script.py`
 # from inside their own directory) -- similarity_embedding.py/similarity_tfidf.py
-# now live in a sibling stage folder (04_scoring/), not next to this file, so
+# now live in a sibling stage folder (03_scoring/), not next to this file, so
 # they need an explicit, __file__-anchored sys.path entry rather than a plain
 # same-folder import.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "04_scoring"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "03_scoring"))
 from similarity_embedding import cosine_similarity_via_dot
 from similarity_tfidf import cosine_similarity_via_dot as tfidf_cosine_similarity_via_dot
 
-ROOT = ".."  # run this script from inside 05_evaluation/
+ROOT = ".."  # run this script from inside 04_evaluation/
 BUSINESS_PROFILES = f"{ROOT}/data/profiles/business_profiles.csv"
 USER_PROFILES = f"{ROOT}/data/profiles/user_profiles.csv"
 REVIEWS_PARQUET = f"{ROOT}/data/interim/philly_reviews.parquet"

@@ -1,6 +1,6 @@
 """
 Cosine similarity scoring between a user TF-IDF profile vector and a sparse
-matrix of business TF-IDF profile vectors (03_profile_building/tfidf/).
+matrix of business TF-IDF profile vectors (02_profile_building/tfidf/).
 Standalone counterpart to similarity_embedding.py -- same contract, sparse
 business matrix instead of dense.
 """

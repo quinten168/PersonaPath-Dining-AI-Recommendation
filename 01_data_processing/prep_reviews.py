@@ -10,8 +10,8 @@ zipped/tarred mount due to FUSE read limits on a remote sandbox). Locally the
 JSON is already extracted, so this just reads it directly line-by-line.
 
 Difference from the original: also keeps `text`, since the embedding step
-(03_profile_building/embedding/embeddings.py) and the TF-IDF vectorizer
-(03_profile_building/tfidf/vectorize.py) need real review text, not just stars.
+(02_profile_building/embedding/embeddings.py) and the TF-IDF vectorizer
+(02_profile_building/tfidf/vectorize.py) need real review text, not just stars.
 """
 import json
 import time

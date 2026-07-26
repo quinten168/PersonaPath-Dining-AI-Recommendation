@@ -12,7 +12,7 @@ and a 384-dimensional dense embedding; every business and user becomes a profile
 both spaces. A live user prompt is vectorized the same way at request time and blended
 with the historical profile match, weighted toward the live prompt.
 
-- **Root:** `01_data_processing/` … `06_recommender_app/` (stage-based layout, see repo root)
+- **Root:** `01_data_processing/` … `05_recommender_app/` (stage-based layout, see repo root)
 - **Primary model:** TF-IDF (`scikit-learn TfidfVectorizer`, 20k features, uni+bigrams, English stopwords)
 - **Secondary model:** `all-MiniLM-L6-v2` (sentence-transformers, local, no API cost)
 - **Storage:** Unity Catalog managed table (raw reviews) + Volumes (generated artifacts) — Databricks-hosted, not local files
@@ -44,7 +44,7 @@ via a live Spark session rather than a local file.
 
 ## Stage 01 — TF-IDF Vectorization & Profile Building *(primary similarity signal)*
 
-**Scripts:** `03_profile_building/tfidf/vectorize.py`, `build_profiles.py`, `aggregation.py`
+**Scripts:** `02_profile_building/tfidf/vectorize.py`, `build_profiles.py`, `aggregation.py`
 
 Fits one global `TfidfVectorizer` (20,000 features, uni+bigrams, English stopwords)
 over the full review corpus, then aggregates per-review TF-IDF rows into one
@@ -63,7 +63,7 @@ construction, no separate labeling step needed.
 
 ## Stage 02 — Review Embedding *(secondary signal, optional)*
 
-**Script:** `03_profile_building/embedding/embeddings.py`
+**Script:** `02_profile_building/embedding/embeddings.py`
 
 Encodes every review independently with `sentence-transformers` (`all-MiniLM-L6-v2`,
 `normalize_embeddings=True`). Additive: the app degrades gracefully to TF-IDF-only for
@@ -79,7 +79,7 @@ both historical similarity and live query matching if these artifacts don't exis
 
 ## Stage 03 — Embedding Profile Aggregation
 
-**Scripts:** `03_profile_building/embedding/aggregation.py`, `build_profiles.py`, `profile_labels.py`
+**Scripts:** `02_profile_building/embedding/aggregation.py`, `build_profiles.py`, `profile_labels.py`
 
 Pools per-review embeddings into one centroid per business/user (same mean/recency
 weighting convention as Stage 01's TF-IDF aggregation), plus a category-prior cold-start
@@ -97,7 +97,7 @@ carry no human meaning.
 
 ## Stage 04 — Live Query Matching & Similarity Scoring *(runs live, per request)*
 
-**Scripts:** `04_scoring/similarity_tfidf.py`, `similarity_embedding.py`, `query_matching.py`
+**Scripts:** `03_scoring/similarity_tfidf.py`, `similarity_embedding.py`, `query_matching.py`
 
 The part that runs at request time. A user's historical TF-IDF profile (optionally
 blended with their embedding profile) is compared against every business via cosine
@@ -117,7 +117,7 @@ should outweigh general taste history.
 
 ## Stage 05 — Evaluation
 
-**Script:** `05_evaluation/evaluate_recommender.py`
+**Script:** `04_evaluation/evaluate_recommender.py`
 
 An 80/20 leave-out harness — Precision@K, Recall@K, NDCG@K, HitRate@K, MRR — comparing
 `tfidf`, `embedding`, `cbf` (the retired LDA+JSD baseline), `popularity`, and `random`
@@ -154,7 +154,7 @@ an open task, not an assumption that the Philadelphia result automatically gener
 
 ## Stage 06 — Recommender *(terminal stage)*
 
-**Script:** `06_recommender_app/app.py`
+**Script:** `05_recommender_app/app.py`
 
 Blends TF-IDF profile similarity (+ optional embedding blend) with live prompt matching
 (Stage 04), applies a `stars × log(1+review_count)` popularity prior, MMR-reranks for
@@ -180,8 +180,8 @@ categories, stars, review_count; business hours have no New Orleans data source 
 ## Source files
 
 `01_data_processing/01_data_processing.ipynb` ·
-`03_profile_building/tfidf/vectorize.py` · `build_profiles.py` · `aggregation.py` ·
-`03_profile_building/embedding/embeddings.py` · `aggregation.py` · `profile_labels.py` · `build_profiles.py` ·
-`04_scoring/similarity_tfidf.py` · `similarity_embedding.py` · `query_matching.py` ·
-`05_evaluation/evaluate_recommender.py` ·
-`06_recommender_app/app.py`
+`02_profile_building/tfidf/vectorize.py` · `build_profiles.py` · `aggregation.py` ·
+`02_profile_building/embedding/embeddings.py` · `aggregation.py` · `profile_labels.py` · `build_profiles.py` ·
+`03_scoring/similarity_tfidf.py` · `similarity_embedding.py` · `query_matching.py` ·
+`04_evaluation/evaluate_recommender.py` ·
+`05_recommender_app/app.py`

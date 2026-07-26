@@ -48,7 +48,7 @@ def match_prompt_to_businesses(
     `embedding_model` / `business_embedding_matrix` are optional: if either
     is None, this returns TF-IDF-only prompt matching, mirroring this
     codebase's existing degrade-gracefully-without-embeddings convention
-    (e.g. 06_recommender_app/app.py's load_embeddings()).
+    (e.g. 05_recommender_app/app.py's load_embeddings()).
     """
     query_tfidf_vec = np.asarray(tfidf_vectorizer.transform([query_text]).todense()).ravel()
     tfidf_scores = tfidf_cosine_similarity(query_tfidf_vec, business_tfidf_matrix)

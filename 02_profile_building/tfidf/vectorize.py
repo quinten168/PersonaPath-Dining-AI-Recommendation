@@ -3,13 +3,13 @@ Fit a single global TF-IDF vectorizer over every New Orleans review and
 transform the corpus into a sparse per-review TF-IDF matrix.
 
 This is the TF-IDF pipeline's counterpart to
-03_profile_building/embedding/embeddings.py -- same input corpus, same role
+02_profile_building/embedding/embeddings.py -- same input corpus, same role
 in the pipeline (per-review vector generation), but a standalone
 implementation: it does not import from the embedding pipeline, and it
 writes its own review-level metadata CSV rather than reusing
 review_embeddings_meta.csv, so the two pipelines share no code or generated
 artifacts end to end. Deliberate, for genuine independence -- see
-03_profile_building/tfidf/aggregation.py's docstring for the same note on
+02_profile_building/tfidf/build_profiles.py's docstring for the same note on
 compute_review_weights().
 
 Why TF-IDF at all, alongside embeddings: sentence embeddings capture
@@ -34,7 +34,7 @@ via spark.table(), not a local file, so this can no longer run as a plain
 
 Vectorizer settings (max_features=20000, ngram_range=(1,2), English stopwords)
 match the embedding pipeline's label-generation TF-IDF
-(03_profile_building/embedding/profile_labels.fit_tfidf) so the two are
+(02_profile_building/embedding/profile_labels.fit_tfidf) so the two are
 comparable on vocabulary size/shape -- not because of a code dependency
 between them.
 """

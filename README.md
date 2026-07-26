@@ -67,7 +67,7 @@ Built on **Apache Spark on Databricks**, with review/business/user data and gene
 
 ## 🔗 Resources & Navigation
 *   🚀 **[Quick Start Guide](INSTRUCTIONS.md)** - How to run the pipeline.
-*   📓 **Pipeline stages** - [`01_data_processing/`](./01_data_processing/) → [`03_profile_building/`](./03_profile_building/) → [`04_scoring/`](./04_scoring/) → [`05_evaluation/`](./05_evaluation/) → [`06_recommender_app/`](./06_recommender_app/) (Data Processing to Interface — see [`ARCHITECTURE.md`](./ARCHITECTURE.md) for stage-by-stage detail).
+*   📓 **Pipeline stages** - [`01_data_processing/`](./01_data_processing/) → [`02_profile_building/`](./02_profile_building/) → [`03_scoring/`](./03_scoring/) → [`04_evaluation/`](./04_evaluation/) → [`05_recommender_app/`](./05_recommender_app/) (Data Processing to Interface — see [`ARCHITECTURE.md`](./ARCHITECTURE.md) for stage-by-stage detail).
 *   📁 **[Demo Walkthrough](./demo/)** - See the engine and walkthrough video in action.
 *   📄 **[Project Flyer](./flier/Team5_PersonaPath_Flier.pdf)** - Executive summary PDF.
 *   📚 **[Bibliography](./BIBLIOGRAPHY.md)** - Data and library credits.
