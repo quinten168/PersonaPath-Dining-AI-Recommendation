@@ -34,7 +34,16 @@ from sklearn.preprocessing import MinMaxScaler
 
 # 03_scoring/ isn't a package -- no relative-import mechanism, so anchor the
 # path off this file's location (same pattern as 04_evaluation/evaluate_recommender.py).
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "03_scoring"))
+# __file__ is undefined when this script is run via exec() -- e.g. pasted into
+# a Databricks notebook cell instead of executed as a real .py file -- so fall
+# back to walking up from the current working directory to find the repo root.
+try:
+    _repo_root = Path(__file__).resolve().parent.parent
+except NameError:
+    _repo_root = Path.cwd()
+    while not (_repo_root / "03_scoring").exists() and _repo_root != _repo_root.parent:
+        _repo_root = _repo_root.parent
+sys.path.insert(0, str(_repo_root / "03_scoring"))
 from similarity_tfidf import cosine_similarity_via_dot as tfidf_cosine_similarity
 from similarity_embedding import cosine_similarity_via_dot as embedding_cosine_similarity
 from query_matching import match_prompt_to_businesses, blend_prompt_and_profile
